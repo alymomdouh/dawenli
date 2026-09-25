@@ -18,7 +18,7 @@ const state = {
   market: { goldG24Egp: null, rates: {}, updatedAt: null },
   profile: [],
   categories: [],
-  finFilter: { dir: "all", cat: "all", q: "", range: "all", limit: 40 },
+  finFilter: { dir: "all", cat: "all", q: "", range: "all", from: "", to: "", limit: 40 },
   finBudget: { month: "", budget: null, goal: null },
   fileFilter: "all",
   pageDate: null,
@@ -35,6 +35,17 @@ const TODAY = () => {
   const n = new Date();
   return `${n.getFullYear()}-${String(n.getMonth() + 1).padStart(2, "0")}-${String(n.getDate()).padStart(2, "0")}`;
 };
+// نفس TODAY بس بياخد تاريخ معيّن — من غير ما نلجأ لـtoISOString (دي UTC).
+const YMD = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+// نطاقات جاهزة للفلتر السريع. آخر ٧ أيام = ٦ أيام فاتوا + النهاردة (٧ أيام 포함 النهاردة).
+function finDateRange(kind) {
+  const n = new Date();
+  if (kind === "today") return [TODAY(), TODAY()];
+  if (kind === "7d") { const s = new Date(n); s.setDate(s.getDate() - 6); return [YMD(s), TODAY()]; }
+  if (kind === "month") return [YMD(new Date(n.getFullYear(), n.getMonth(), 1)), YMD(new Date(n.getFullYear(), n.getMonth() + 1, 0))];
+  if (kind === "lastmonth") return [YMD(new Date(n.getFullYear(), n.getMonth() - 1, 1)), YMD(new Date(n.getFullYear(), n.getMonth(), 0))];
+  return ["", ""];
+}
 
 /* ===================== Helpers ===================== */
 // أرقام هندية زي التصميم: ٧.٢ ، ١٬٨٠٠
@@ -178,9 +189,9 @@ window.del = del;
 const escAttr = (s) => escapeHtml(s).replace(/"/g, "&quot;");
 const EDIT_CONFIGS = {
   finance: { title: "تعديل عملية", source: () => state.finance, fields: [
-    { key: "direction", label: "النوع", type: "select", options: [["expense", "صرف ➖"], ["income", "دخل ➕"]] },
+    { key: "direction", label: "النوع", type: "select", options: [["expense", "صرف −"], ["income", "دخل +"]] },
     { key: "amount", label: "المبلغ", type: "number" },
-    { key: "category", label: "البند", type: "select", options: () => (state.categories || []).map((c) => [c, c]) },
+    { key: "category", label: "الصنف", type: "select", options: () => (state.categories || []).map((c) => [catName(c), catIcon(c) + " " + catName(c)]) },
     { key: "note", label: "ملاحظة", type: "text" },
     { key: "entry_date", label: "التاريخ", type: "date" },
   ] },
@@ -1835,6 +1846,8 @@ function renderFinancesPage() {
   drawSketchBars($("finBars"), weekData, "finances", 200);
 
   // على إيه بتصرف — آخر ٣٠ يوم
+  // القود اللي مربوطة بطرف (رصيد شخص) مش مصروف على بند، فبنستبعدها من
+  // التجميع — دي بتظهر في «الأشخاص والأرصدة» مش هنا.
   const month = lastNDays(30);
   const byCat = {};
   for (const f of data.filter((f) => f.direction === "expense" && month.includes(f.entry_date) && isEGP(f))) {
@@ -1867,6 +1880,8 @@ function renderFinancesPage() {
   // ميزانية/هدف الشهر + قائمة العمليات بفلاتر وتحميل المزيد
   renderBudget();
   fillFinFilterCat();
+  normalizeFinDates();
+  syncFinDateChips();
   renderFinList();
 }
 const AR_MONTHS = ["يناير", "فبراير", "مارس", "أبريل", "مايو", "يونيو", "يوليو", "أغسطس", "سبتمبر", "أكتوبر", "نوفمبر", "ديسمبر"];
@@ -1892,8 +1907,8 @@ function renderFinIncome(incomeByMonth, curKey) {
 function finRowHtml(f) {
   return `<div class="list-row">
     <div class="lm">
-      <span class="l1">${f.direction === "income" ? "➕ دخل" : "➖ صرف"} · ${fmtShort(f.entry_date)}${f.category ? ` · ${CAT_ICONS[f.category] || ""} ${escapeHtml(f.category)}` : ""}</span>
-      <span class="l2">${escapeHtml(f.note || "—")}</span>
+      <span class="l1">${f.direction === "income" ? "＋ دخل" : "－ صرف"} · ${fmtShort(f.entry_date)}${f.category ? ` · ${CAT_ICONS[f.category] || ""} ${escapeHtml(f.category)}` : ""}</span>
+      <span class="l2">${escapeHtml(f.note || "-")}</span>
     </div>
     <div class="row-actions">
       <span class="l-amount ${f.direction === "income" ? "pos" : "neg"}">${arNum(f.amount)} ${curLabel(f)}</span>
@@ -1927,7 +1942,34 @@ function applyFinFilter() {
       return true;
     });
   }
+  // فلتر التاريخ: entry_date مخزّن كنص YYYY-MM-DD، فالمقارنة نصية آمنة وترتيبها صحيح.
+  if (f.from) rows = rows.filter((r) => (r.entry_date || "") >= f.from);
+  if (f.to) rows = rows.filter((r) => (r.entry_date || "") <= f.to);
   return rows;
+}
+// لو المستخدم wrote تاريخ النهاية قبل البداية، نعكسهم بدل ما نرجّع صفر نتيجة.
+function normalizeFinDates() {
+  const f = state.finFilter;
+  if (f.from && f.to && f.from > f.to) { const t = f.from; f.from = f.to; f.to = t; }
+  const from = $("finDateFrom"), to = $("finDateTo");
+  if (from && from.value !== f.from) from.value = f.from;
+  if (to && to.value !== f.to) to.value = f.to;
+}
+// تظليل الاختصار اللي وافق على النطاق الحالي (أو "كل التواريخ" لو الحقلين فاضيين).
+function syncFinDateChips() {
+  const f = state.finFilter;
+  const [a, b] = f.from || f.to ? [f.from, f.to] : ["", ""];
+  for (const chip of document.querySelectorAll("#finDatePresets .filter-chip, .date-presets .filter-chip")) {
+    const k = chip.dataset.range;
+    const on = k === "all" ? !(a || b) : finDateRange(k)[0] === a && finDateRange(k)[1] === b;
+    chip.classList.toggle("on", on);
+  }
+}
+function setFinDateRange(kind) {
+  const [a, b] = finDateRange(kind);
+  state.finFilter.from = a; state.finFilter.to = b;
+  state.finFilter.limit = 40;
+  normalizeFinDates(); syncFinDateChips(); renderFinList();
 }
 function renderFinList() {
   const el = $("finList");
@@ -1937,7 +1979,11 @@ function renderFinList() {
   const exp = all.filter((r) => r.direction === "expense").reduce((a, r) => a + r.amount, 0);
   const inc = all.filter((r) => r.direction === "income").reduce((a, r) => a + r.amount, 0);
   const meta = $("finFilterMeta");
-  if (meta) meta.innerHTML = all.length ? `${arNum(all.length)} عملية · صرف ${arNum(exp)} ${MONEY}${inc ? ` · دخل ${arNum(inc)} ${MONEY}` : ""}` : "";
+  const f = state.finFilter;
+  const span = f.from || f.to
+    ? `<span class="fin-span">📅 ${f.from ? fmtDate(f.from + "T00:00:00") : "البداية"} ← ${f.to ? fmtDate(f.to + "T00:00:00") : "النهارده"}</span>`
+    : "";
+  if (meta) meta.innerHTML = (all.length ? `${arNum(all.length)} عملية · صرف ${arNum(exp)} ${MONEY}${inc ? ` · دخل ${arNum(inc)} ${MONEY}` : ""}` : "") + span;
   el.innerHTML = shown.length ? shown.map(finRowHtml).join("") : `<div class="empty sm">${DOODLE}<p>مفيش عمليات بالفلاتر دي.</p></div>`;
   const lm = $("finLoadMore");
   if (lm) lm.innerHTML = all.length > shown.length ? `<button class="btn secondary sm" id="finMoreBtn">تحميل المزيد (${arNum(all.length - shown.length)} فاضلين)</button>` : "";
@@ -1946,6 +1992,18 @@ $("finFilterDir")?.addEventListener("change", (e) => { state.finFilter.dir = e.t
 $("finFilterCat")?.addEventListener("change", (e) => { state.finFilter.cat = e.target.value; state.finFilter.limit = 40; renderFinList(); });
 $("finFilterQ")?.addEventListener("input", (e) => { state.finFilter.q = e.target.value; state.finFilter.limit = 40; renderFinList(); });
 $("finFilterRange")?.addEventListener("change", (e) => { state.finFilter.range = e.target.value; state.finFilter.limit = 40; renderFinList(); });
+// فلتر التاريخ: الحقلين + الاختصارات. الكتابة اليدوية بتمسح تظليل الاختصار.
+for (const id of ["finDateFrom", "finDateTo"]) {
+  $(id)?.addEventListener("change", (e) => {
+    state.finFilter[id === "finDateFrom" ? "from" : "to"] = e.target.value;
+    state.finFilter.limit = 40;
+    normalizeFinDates(); syncFinDateChips(); renderFinList();
+  });
+}
+document.querySelector(".date-presets")?.addEventListener("click", (e) => {
+  const chip = e.target.closest(".filter-chip");
+  if (chip) setFinDateRange(chip.dataset.range);
+});
 $("finLoadMore")?.addEventListener("click", (e) => { if (e.target.id === "finMoreBtn") { state.finFilter.limit += 40; renderFinList(); } });
 // الضغط على بوكس بند = فلتر القايمة على البند ده
 $("finCatBoxes")?.addEventListener("click", (e) => {
@@ -2026,11 +2084,136 @@ $("finForm").addEventListener("submit", async (e) => {
   renderFinancesPage();
 });
 resetFinDate();
+// الأصناف بقت كائنات {id,name,icon} من جدول finance_categories — الأيقونة
+// من القاعدة، وCAT_ICONS بس fallback للأصناف القديمة اللي مالوش أيقونة مخزّنة.
+const catName = (c) => (typeof c === "string" ? c : c?.name || "");
+const catIcon = (c) => (typeof c === "string" ? CAT_ICONS[c] || "" : c?.icon || CAT_ICONS[c?.name] || "");
 function fillCategorySelect() {
   const sel = $("finCategory");
   if (!sel || !state.categories.length) return;
-  sel.innerHTML = state.categories.map((c) => `<option value="${c}">${CAT_ICONS[c] || ""} ${c}</option>`).join("");
+  const cur = sel.value;
+  sel.innerHTML = state.categories
+    .map((c) => `<option value="${escapeHtml(catName(c))}">${catIcon(c)} ${escapeHtml(catName(c))}</option>`)
+    .join("");
+  if (cur && state.categories.some((c) => catName(c) === cur)) sel.value = cur;
 }
+/* ===== إدارة أصناف الصرف =====
+   موديل واحد: إضافة/إعادة تسمية/حذف أصناف الصرف من غير ما نعدّل الكود. */
+const FIN_MANAGE = {
+  kind: "categories",
+  editingId: null,
+  open() {
+    this.kind = "categories";
+    this.editingId = null;
+    $("finManageHint").textContent = "حذف صنف بيرجّع قيوده لأخرى. «أخرى» ما بتتحذفش.";
+    $("finManageName").value = "";
+    $("finManageIcon").value = "";
+    this.status("");
+    $("finManageOverlay")?.classList.remove("hidden");
+    this.render();
+    $("finManageName")?.focus();
+  },
+  close() {
+    $("finManageOverlay")?.classList.add("hidden");
+    this.editingId = null;
+  },
+    get items() { return state.categories || []; },
+  // api() بترجع Response ومي بترميش على 4xx، فبنقرا res.ok بأنفسنا.
+  status(msg) {
+    const el = $("finManageStatus");
+    if (el) el.textContent = msg || "";
+  },
+  async send(res, okMsg) {
+    if (res.ok) { this.status(""); const r = await res.json().catch(() => ({})); await this.refresh(); return r; }
+    const r = await res.json().catch(() => ({}));
+    this.status(r.error || `فشل (${res.status})`);
+    return null;
+  },
+  render() {
+    const el = $("finManageList");
+    if (!el) return;
+    const items = this.items;
+    if (!items.length) {
+      el.innerHTML = `<div class="fin-manage-empty">القائمة فاضية — أضف أول عنصر من فوق.</div>`;
+      return;
+    }
+    el.innerHTML = items.map((it) => {
+      const nm = catName(it);
+      const ic = catIcon(it);
+      if (this.editingId === it.id) {
+        return `<div class="fin-manage-row" data-id="${it.id}">
+          <input class="field fm-edit" id="fmEditName" value="${escapeHtml(nm)}" maxlength="40" />
+          <input class="field fm-edit" id="fmEditIcon" value="${escapeHtml(ic)}" maxlength="4" style="width:56px;text-align:center" />
+          <button type="button" class="btn finances sm" data-act="save">حفظ</button>
+          <button type="button" class="btn ghost sm" data-act="cancel">إلغاء</button>
+        </div>`;
+      }
+      return `<div class="fin-manage-row" data-id="${it.id}">
+        <span class="fm-icon">${ic || "📦"}</span>
+        <span class="fm-name">${escapeHtml(nm)}</span>
+        ${extra}
+        <button type="button" class="icon-btn" data-act="edit" title="إعادة تسمية" aria-label="إعادة تسمية ${escapeHtml(nm)}">✎</button>
+        <button type="button" class="icon-btn" data-act="del" title="حذف" aria-label="حذف ${escapeHtml(nm)}">🗑</button>
+      </div>`;
+    }).join("");
+  },
+  async refresh() {
+    const base = "/api/finance-categories";
+    const r = await api(base).then((x) => x.json());
+    state.categories = r;
+    this.render();
+    fillCategorySelect();
+  },
+};
+
+$("finManageClose")?.addEventListener("click", () => FIN_MANAGE.close());
+$("finManageOverlay")?.addEventListener("click", (e) => { if (e.target === $("finManageOverlay")) FIN_MANAGE.close(); });
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !$("finManageOverlay")?.classList.contains("hidden")) FIN_MANAGE.close();
+});
+$("finManageCats")?.addEventListener("click", () => FIN_MANAGE.open());
+
+$("finManageForm")?.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const name = $("finManageName").value.trim();
+  const icon = $("finManageIcon").value.trim();
+  if (!name) return;
+  const base = "/api/finance-categories";
+  const r = await FIN_MANAGE.send(await api(base, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name, icon }) }));
+  if (!r) return;
+  $("finManageName").value = ""; $("finManageIcon").value = "";
+});
+
+$("finManageList")?.addEventListener("click", async (e) => {
+  const btn = e.target.closest("[data-act]");
+  if (!btn) return;
+  const row = btn.closest(".fin-manage-row");
+  const id = Number(row?.dataset.id);
+  if (!id) return;
+  const act = btn.dataset.act;
+  const base = "/api/finance-categories";
+  if (act === "edit") { FIN_MANAGE.editingId = id; FIN_MANAGE.render(); $("fmEditName")?.focus(); return; }
+  if (act === "cancel") { FIN_MANAGE.editingId = null; FIN_MANAGE.render(); return; }
+  if (act === "save") {
+    const name = $("fmEditName")?.value.trim();
+    const icon = $("fmEditIcon")?.value.trim();
+    if (!name) return;
+    const r = await FIN_MANAGE.send(await api(`${base}/${id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name, icon }) }));
+    if (!r) return;
+    FIN_MANAGE.editingId = null;
+    await loadAll(false);
+    return;
+  }
+  if (act === "del") {
+    const nm = (state.categories || []).find((x) => x.id === id);
+    const label = catName(nm);
+    if (!(await askConfirm({ title: "تأكيد الحذف", text: `هتحذف «${label}».`, ok: "احذف", danger: true }))) return;
+    const r = await FIN_MANAGE.send(await api(`${base}/${id}`, { method: "DELETE" }));
+    if (!r) return;
+    if (r.moved) FIN_MANAGE.status(`نقلنا ${arNum(r.moved)} قيد لأخرى`);
+    await loadAll(false);
+  }
+});
 
 /* أعمدة مرسومة باليد — مقتبسة من BarChart بتاع الـ design system */
 function drawSketchBars(canvas, data, accent = "finances", height = 200) {

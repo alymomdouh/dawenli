@@ -406,7 +406,10 @@
                   <div id="catBars" class="cat-bars"></div>
                 </div>
                 <div class="card">
-                  <div class="card-head"><h3>عملية جديدة</h3></div>
+                  <div class="card-head">
+                    <h3>عملية جديدة</h3>
+                    <button type="button" class="btn ghost sm" id="finManageCats">⚙ الأصناف</button>
+                  </div>
                   <form id="finForm" class="inline-form">
                     <select id="finDir" class="field">
                       <option value="expense">صرف ➖</option>
@@ -443,6 +446,19 @@
                       <option value="gt5000">أكتر من ٥٠٠٠</option>
                     </select>
                     <input id="finFilterQ" class="field grow" placeholder="بحث في الملاحظات…" />
+                  </div>
+                  <div class="filter-bar fin-date-bar">
+                    <span class="fin-date-lab">من</span>
+                    <input id="finDateFrom" class="field fin-date" type="date" aria-label="تاريخ البداية" title="من تاريخ" />
+                    <span class="fin-date-lab">إلى</span>
+                    <input id="finDateTo" class="field fin-date" type="date" aria-label="تاريخ النهاية" title="إلى تاريخ" />
+                    <div class="date-presets" role="group" aria-label="اختصارات التاريخ">
+                      <button type="button" class="filter-chip on" data-range="all">كل التواريخ</button>
+                      <button type="button" class="filter-chip" data-range="today">النهاردة</button>
+                      <button type="button" class="filter-chip" data-range="7d">آخر ٧ أيام</button>
+                      <button type="button" class="filter-chip" data-range="month">الشهر ده</button>
+                      <button type="button" class="filter-chip" data-range="lastmonth">الشهر اللي فات</button>
+                    </div>
                   </div>
                   <div id="finFilterMeta" class="filter-meta"></div>
                   <div id="finList" class="list"></div>
@@ -920,6 +936,26 @@
           <button class="icon-btn" id="editClose" aria-label="إغلاق">✕</button>
         </div>
         <form id="editForm" class="edit-form"></form>
+      </div>
+    </div>
+
+    <!-- إدارة أصناف الصرف: إضافة/إعادة تسمية/حذف بدون تعديل الكود -->
+    <div id="finManageOverlay" class="modal-overlay hidden">
+      <div class="modal" role="dialog" aria-modal="true" style="text-align:right;max-width:460px">
+        <div class="edit-head">
+          <h3 class="modal-title" id="finManageTitle" style="margin:0">أصناف الصرف</h3>
+          <button class="icon-btn" id="finManageClose" aria-label="إغلاق">✕</button>
+        </div>
+        <div class="fin-manage">
+          <form id="finManageForm" class="inline-form" autocomplete="off">
+            <input id="finManageName" class="field grow" placeholder="الصنف الجديد" required maxlength="40" />
+            <input id="finManageIcon" class="field" placeholder="رمز" maxlength="4" style="width:64px;text-align:center" />
+            <button type="submit" class="btn finances sm">＋ إضافة</button>
+          </form>
+          <div id="finManageList" class="fin-manage-list"></div>
+          <p class="muted" id="finManageHint" style="font-size:var(--text-sm);margin:10px 0 0"></p>
+          <p id="finManageStatus" style="font:var(--type-label);color:var(--danger-deep,#b52b27);margin:8px 0 0;min-height:1.2em"></p>
+        </div>
       </div>
     </div>
 

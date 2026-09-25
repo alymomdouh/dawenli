@@ -779,6 +779,14 @@ a { color: inherit; }
 .filter-bar { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
 .filter-bar .field { padding: 8px 12px; font-size: var(--text-sm); }
 .filter-meta { font-size: var(--text-sm); color: var(--ink-muted); margin: 0 2px 10px; }
+/* فلتر التاريخ: صف منفصل تحت الفلاتر عشان ما يزحّمش شريط البحث */
+.fin-date-bar { align-items: center; margin-bottom: 12px; }
+.fin-date-lab { font: 700 var(--text-xs)/1 var(--font-body); color: var(--ink-muted); }
+.filter-bar .fin-date { padding: 7px 10px; font-size: var(--text-sm); width: auto; min-width: 0; }
+.date-presets { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.date-presets .filter-chip { padding: 5px 11px; }
+.fin-span { display: inline-block; margin-inline-start: 8px; padding: 2px 9px; border-radius: var(--radius-pill);
+  background: var(--finances-wash); color: var(--finances-deep); font: 700 var(--text-xs)/1.6 var(--font-body); }
 .load-more { display: flex; justify-content: center; margin-top: 12px; }
 
 .files-filter { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
@@ -1141,7 +1149,7 @@ select.field { cursor: pointer; }
 .inline-form { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
 .inline-form .grow { flex: 1; min-width: 140px; }
 
-/* حقل التاريخ: نايتف，免得 نبني تقويم من الصفر. بيتقيّد بـ max = النهارده
+/* حقل التاريخ: أصلي (native)، مشتقوّم من الصفر. بيتقيّد بـ max = النهارده
    فميقدرش يسجّل عملية مستقبلية، وبيقبل أي يوم قديم. */
 input[type="date"].field {
   width: 148px;
@@ -1155,6 +1163,28 @@ input[type="date"].field::-webkit-calendar-picker-indicator {
 }
 input[type="date"].field::-webkit-calendar-picker-indicator:hover { opacity: 1; }
 input[type="date"].field:focus::-webkit-calendar-picker-indicator { opacity: 0.9; }
+
+/* ---- إدارة الأصناف والأشخاص ---- */
+.fin-manage { padding: 14px 16px 18px; }
+.fin-manage-list {
+  display: flex; flex-direction: column; gap: 6px;
+  margin-top: 14px; max-height: 46vh; overflow-y: auto;
+}
+.fin-manage-row {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 12px;
+  background: var(--surface-raised);
+  border: 1.5px solid var(--hairline);
+  border-radius: var(--radius-sm);
+}
+.fin-manage-row .fm-name { flex: 1; min-width: 0; font: var(--type-body); }
+.fin-manage-row .fm-meta { font: var(--type-label); color: var(--ink-muted); font-size: var(--text-xs); }
+.fin-manage-row .fm-icon { font-size: 1.1em; }
+.fin-manage-row .field { padding: 6px 10px; font-size: var(--text-sm); }
+.fin-manage-row input.fm-edit { flex: 1; min-width: 0; }
+.fin-manage-empty { padding: 14px 0; text-align: center; color: var(--ink-faint); font-size: var(--text-sm); }
+
+
 
 /* ===========================================================================
    تدوينات اليوميات

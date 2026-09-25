@@ -17,7 +17,11 @@ import {
   listFinance,
   addFinance,
   deleteFinance,
-  FINANCE_CATEGORIES,
+  listFinanceCategories,
+  ensureFinanceCategories,
+  addFinanceCategory,
+  renameFinanceCategory,
+  deleteFinanceCategory,
   listHealth,
   addHealth,
   deleteHealth,
@@ -1176,9 +1180,35 @@ export async function createApp() {
   });
 
   /* ===== ماليات: إضافة يدوية من الداشبورد ===== */
+  // أصناف الصرف: من جدول finance_categories (كل مستخدم وليّه قائمته)، وبنتزرع
+  // الافتراضي أول مرة. الشكل بقى كائن {id,name,icon} بدل نص.
   app.get("/api/finance-categories", async (req, res) => {
-    if (!(await gate(req, res))) return;
-    res.json(FINANCE_CATEGORIES);
+    const user = await gate(req, res);
+    if (!user) return;
+    res.json(await ensureFinanceCategories(user.id));
+  });
+  app.post("/api/finance-categories", async (req, res) => {
+    const user = await gate(req, res);
+    if (!user) return;
+    const { name, icon } = req.body || {};
+    const r = await addFinanceCategory({ userId: user.id, name, icon });
+    if (r.error) return res.status(400).json({ error: r.error });
+    res.json({ ok: true, id: r.id, categories: await listFinanceCategories(user.id) });
+  });
+  app.put("/api/finance-categories/:id", async (req, res) => {
+    const user = await gate(req, res);
+    if (!user) return;
+    const { name, icon } = req.body || {};
+    const r = await renameFinanceCategory({ userId: user.id, id: Number(req.params.id), name, icon });
+    if (r.error) return res.status(400).json({ error: r.error });
+    res.json({ ok: true, categories: await listFinanceCategories(user.id) });
+  });
+  app.delete("/api/finance-categories/:id", async (req, res) => {
+    const user = await gate(req, res);
+    if (!user) return;
+    const r = await deleteFinanceCategory({ userId: user.id, id: Number(req.params.id) });
+    if (r.error) return res.status(400).json({ error: r.error });
+    res.json({ ...r, categories: await listFinanceCategories(user.id) });
   });
 
   /* ===== ميزانية وهدف الشهر ===== */

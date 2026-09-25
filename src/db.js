@@ -40,6 +40,21 @@ await db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_finance_date ON finance(entry_date);
 
+  /* أصناف الصرف — قائمة لكل مستخدم، بتتدار من الواجهة (مش ثابتة في الكود).
+     finance.category لسه نص (اسم) عشان نتفادى كسر القيود القديمة؛ إعادة التسمية
+     بتنزل cascade على القيود، والحذف بيرجّعها لأخرى. */
+  CREATE TABLE IF NOT EXISTS finance_categories (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL,
+    name        TEXT NOT NULL,
+    icon        TEXT,
+    sort_order  INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL,
+    UNIQUE(user_id, name)
+  );
+  CREATE INDEX IF NOT EXISTS idx_fincat_user ON finance_categories(user_id, sort_order, id);
+
+
   CREATE TABLE IF NOT EXISTS health (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at  TEXT NOT NULL,
@@ -312,6 +327,7 @@ for (const t of ["entries", "finance", "health", "conversations", "goals", "cond
 }
 await addColumnIfMissing("health", "body_region", "TEXT");
 await addColumnIfMissing("finance", "category", "TEXT"); // أكل، مواصلات، فواتير...
+await addColumnIfMissing("finance", "currency", "TEXT");
 await addColumnIfMissing("users", "email", "TEXT");          // التسجيل بالإيميل
 await addColumnIfMissing("users", "password_hash", "TEXT");
 await addColumnIfMissing("tasks", "completed_at", "TEXT");
@@ -362,7 +378,7 @@ export async function purgeExpiredSessions() {
 
 // ===== Rate limiting =====
 // كان Map في الذاكرة — يعني على Vercel كل cold start بيصفّر العداد
-// تعليق企图 تخمين كلمات السر. دلوقتي العداد عايش في الداتابيز.
+// تعليق «محاولة تخمين كلمات السر». دلوقتي العداد عايش في الداتابيز.
 await db.exec(`
   CREATE TABLE IF NOT EXISTS rate_limits (
     bucket   TEXT NOT NULL,
@@ -714,18 +730,77 @@ export async function deleteEntry(userId, id) {
 
 /* ===================== Finance (ماليات) ===================== */
 
-export const FINANCE_CATEGORIES = [
-  "أكل",
-  "مواصلات",
-  "فواتير",
-  "صحة",
-  "تسوق",
-  "ترفيه",
-  "بيت",
-  "شغل",
-  "تعليم",
-  "أخرى",
+// تطبيع اسم الصنف/الشخص للمقارنة — نفس قواعد normNote (تشكيل، تطويل، صور
+// الألف والياء والتاء والهمزة، مسافات). ده اللي بيخلّي «اختى» و«أختي»
+// و«اختي» يتعاملوا كاسم واحد. normNote دالة مُعلَنة فـhoisted، ينفع
+// نادّيها هنا.
+const normName = (s) => normNote(s);
+
+// أصناف الصرف الافتراضية — بتتزرع مرة واحدة لكل مستخدم في أول قراءة، وبعدين
+// كل تعديل (إضافة/إعادة تسمية/حذف) بيتخزن في جدول finance_categories.
+const DEFAULT_FINANCE_CATEGORIES = [  ["أكل", "🍔"], ["مواصلات", "🚌"], ["فواتير", "🧾"], ["صحة", "💊"], ["تسوق", "🛍️"],
+  ["ترفيه", "🎮"], ["بيت", "🏠"], ["شغل", "💼"], ["تعليم", "📚"], ["أخرى", "📦"],
 ];
+// متبقي لـ COMPAT: القراءة من الجدول بقت المصدر الوحيد، والقيمة دي fallback
+// بس لو الجدول فاضي (مستخدم لسه متزرعش).
+export const FINANCE_CATEGORIES = DEFAULT_FINANCE_CATEGORIES.map(([n]) => n);
+
+const listFinCatsStmt = db.prepare(
+  `SELECT id, name, icon, sort_order FROM finance_categories WHERE user_id = ? ORDER BY sort_order, id`
+);
+export async function listFinanceCategories(userId) {
+  return (await listFinCatsStmt.all(userId));
+}
+// زرع مرة واحدة: لو المستخدم مالوش صفوف، نزرع الافتراضي. وبعدها القراءة من الجدول بس.
+export async function ensureFinanceCategories(userId) {
+  const rows = await listFinanceCategories(userId);
+  if (rows.length) return rows;
+  for (const [i, [name, icon]] of DEFAULT_FINANCE_CATEGORIES.entries()) {
+    await db.prepare(
+      `INSERT OR IGNORE INTO finance_categories (user_id, name, icon, sort_order, created_at) VALUES (?, ?, ?, ?, ?)`
+    ).run(userId, name, icon, i, now());
+  }
+  return (await listFinCatsStmt.all(userId));
+}
+export async function addFinanceCategory({ userId, name, icon }) {
+  const nm = normName(name);
+  if (!nm) return { error: "اسم الصنف مطلوب" };
+  const dupe = (await listFinanceCategories(userId)).find((c) => normName(c.name) === nm);
+  if (dupe) return { error: "الصنف موجود بالفعل" };
+  const mx = (await db.prepare(`SELECT COALESCE(MAX(sort_order), -1) m FROM finance_categories WHERE user_id = ?`).get(userId));
+  const info = await db.prepare(
+    `INSERT INTO finance_categories (user_id, name, icon, sort_order, created_at) VALUES (?, ?, ?, ?, ?)`
+  ).run(userId, String(name).trim(), icon || null, Number(mx.m) + 1, now());
+  return { id: Number(info.lastInsertRowid) };
+}
+// إعادة تسمية بتنزل cascade على القيود القديمة، عشان ما تبقاش قراءة بسطر ميت.
+export async function renameFinanceCategory({ userId, id, name, icon }) {
+  const nm = normName(name);
+  if (!nm) return { error: "اسم الصنف مطلوب" };
+  const cur = await db.prepare(`SELECT * FROM finance_categories WHERE user_id = ? AND id = ?`).get(userId, id);
+  if (!cur) return { error: "الصنف غير موجود" };
+  const clash = (await listFinanceCategories(userId)).find((c) => c.id !== Number(id) && normName(c.name) === nm);
+  if (clash) return { error: "في صنف بنفس الاسم" };
+  await db.prepare(`UPDATE finance_categories SET name = ?, icon = ? WHERE user_id = ? AND id = ?`)
+    .run(String(name).trim(), icon === undefined ? cur.icon : (icon || null), userId, id);
+  if (String(name).trim() !== cur.name) {
+    await db.prepare(`UPDATE finance SET category = ? WHERE user_id = ? AND category = ?`)
+      .run(String(name).trim(), userId, cur.name);
+  }
+  return { ok: true };
+}
+// حذف: القيود المرتبطة ما تتمسحش — بترجع لأخرى عشان فاقدش فلوسه من السجل.
+export async function deleteFinanceCategory({ userId, id }) {
+  const cur = await db.prepare(`SELECT * FROM finance_categories WHERE user_id = ? AND id = ?`).get(userId, id);
+  if (!cur) return { error: "الصنف غير موجود" };
+  if (cur.name === "أخرى") return { error: "مينفعش تحذف «أخرى»" };
+  await ensureFinanceCategories(userId); // نتأكد إن «أخرى» موجودة قبل ما نرجّعليها
+  const moved = (await db.prepare(
+    `UPDATE finance SET category = 'أخرى' WHERE user_id = ? AND category = ?`
+  ).run(userId, cur.name)).changes;
+  await db.prepare(`DELETE FROM finance_categories WHERE user_id = ? AND id = ?`).run(userId, id);
+  return { ok: true, movedTo: "أخرى", moved: Number(moved || 0) };
+}
 
 // تطبيع نص للمقارنة (شيل المسافات الزيادة + حروف صغيرة) — لكشف التكرار.
 // تطبيع الملاحظة للمقارنة: تشكيل/تطويل + صور الألف والياء والتاء المربوطة والهمزة
@@ -767,7 +842,7 @@ export async function addFinance({ userId, entryDate, direction, amount, currenc
     dir,
     amt,
     currency || "جنيه",
-    category && FINANCE_CATEGORIES.includes(category) ? category : category || "أخرى",
+    category || "أخرى",
     note || null
   ));
   // ربط تلقائي: الدخل/الصرف بعملة معيّنة يزوّد/ينقّص أي هدف بنفس الوحدة (مثلاً هدف «دولار»)
@@ -1959,7 +2034,10 @@ export async function updateFinance(userId, id, patch) {
   const p = { ...patch };
   if (p.amount !== undefined) p.amount = Number(p.amount) || 0;
   if (p.direction !== undefined) p.direction = p.direction === "income" ? "income" : "expense";
-  if (p.category !== undefined && !FINANCE_CATEGORIES.includes(p.category)) p.category = p.category || "أخرى";
+  // الأصناف بقت من جدول finance_categories (المستخدم بيضيف ويعدّل)، فمافيش
+  // قائمة بيضاء تتقفل على الثوابت. بنقبل أي نص فاضي مش، ونتجاهل أي قيمة
+  // مش نص أصلاً.
+  if (p.category !== undefined) p.category = String(p.category || "").trim() || "أخرى";
   return (await updateOwned("finance", ["entry_date", "direction", "amount", "category", "note"], userId, id, p));
 }
 export async function updateHealth(userId, id, patch) {
