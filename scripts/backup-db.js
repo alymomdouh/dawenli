@@ -5,9 +5,21 @@ import "dotenv/config";
 import Database from "better-sqlite3";
 import { mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
+import { config } from "../src/config.js";
+
+// السكربت ده بيشتغل على ملف محلي بس. لو الداتابيز ريموتة (Turso) فمش هينفع
+// ينسخ ملف — وTurbo عنده point-in-time recovery فالنسخ اليدوي مش محتاج.
+if (!config.tursoUrl.startsWith("file:")) {
+  console.error("❌ النسخ الاحتياطي المحلي مش متاح على داتابيز ريموتة.");
+  console.error(`  TURSO_DATABASE_URL = ${config.tursoUrl}`);
+  console.error("   استخدم scripts/migrate-to-turso.js للترحيل، أو صدّر نسخة من Turso dashboard.");
+  process.exit(1);
+}
 
 const KEEP = Number(process.env.BACKUP_KEEP || 14);
-const dbPath = process.env.DB_PATH || "./data/dawenli.db";
+// المسار الفعلي بقى من config (شيلنا file:) — مش DB_PATH، لإنه لما TURSO فاضي
+// التطبيق بيشتغل على data/dawenli-local.db لا على داتابيز قديمة.
+const dbPath = config.tursoUrl.replace(/^file:/, "");
 const dir = join(dirOf(dbPath), "backups");
 
 function dirOf(p) {

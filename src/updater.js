@@ -28,6 +28,8 @@ async function git(args, timeout = 60000) {
 }
 
 export function isGitRepo() {
+  // على Vercel مفيش .git أصلاً، والتحديث من السيرفر مش موجود
+  if (config.isServerless) return false;
   return existsSync(join(REPO_DIR, ".git"));
 }
 

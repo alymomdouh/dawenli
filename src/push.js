@@ -19,32 +19,32 @@ export const vapidPublicKey = config.vapidPublic;
 // استخدمه في أي مكان عايز تنبّه فيه المستخدم.
 export async function notifyUser(userId, payload = {}) {
   try {
-    addNotification(userId, {
+    (await addNotification(userId, {
       title: payload.title || "دوّنلي",
       body: payload.body || "",
       url: payload.url || "/",
       icon: payload.icon || "🔔",
-    });
+    }));
   } catch {}
-  return sendPushToUser(userId, payload);
+  return (await sendPushToUser(userId, payload));
 }
 
 // بيبعت إشعار لكل أجهزة مستخدم واحد. بيشيل أي اشتراك بقى منتهي (404/410).
 export async function sendPushToUser(userId, payload) {
   if (!pushEnabled || !userId) return 0;
-  const subs = listPushSubscriptions(userId);
+  const subs = (await listPushSubscriptions(userId));
   if (!subs.length) return 0;
   const body = JSON.stringify(payload || {});
   let sent = 0;
   await Promise.all(
-    subs.map(async (s) => {
+    subs.map( async (s) => {
       const sub = { endpoint: s.endpoint, keys: { p256dh: s.p256dh, auth: s.auth } };
       try {
         await webpush.sendNotification(sub, body);
         sent++;
       } catch (err) {
         if (err?.statusCode === 404 || err?.statusCode === 410) {
-          deletePushSubscription(s.endpoint); // الاشتراك مات
+          (await deletePushSubscription(s.endpoint)); // الاشتراك مات
         } else {
           console.error("push send error:", err?.statusCode || err?.message);
         }

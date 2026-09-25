@@ -15,7 +15,14 @@ export const config = {
   ttsVoice: process.env.OPENAI_TTS_VOICE || "alloy",
   port: Number(process.env.PORT || 3000),
   dashboardPassword: process.env.DASHBOARD_PASSWORD || "change-me",
-  dbPath: process.env.DB_PATH || "./data/dawenli.db",
+  // الداتابيز: libSQL/Turso عن بُعد. محليًا ممكن تسيب file: عشان يشتغل من غير نت.
+  tursoUrl: process.env.TURSO_DATABASE_URL || "file:./data/dawenli-local.db",
+  tursoAuthToken: process.env.TURSO_AUTH_TOKEN || "",
+  // على Vercel مفيش process طويل التشغيل — الجدولة بتيجي من Vercel Cron على endpoint
+  // محمي بـ CRON_SECRET (Vercel بيبعته في هيدر Authorization: Bearer <secret>)
+  cronSecret: process.env.CRON_SECRET || "",
+  // بن detect إننا على Vercel عشان نعرف نستخدم cron بدل setInterval
+  isServerless: Boolean(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME),
   // مواعيد المبادرة (بتوقيت القاهرة)
   timezone: process.env.TIMEZONE || "Africa/Cairo",
   checkinHour: Number(process.env.CHECKIN_HOUR ?? 21), // الـ agent بيسأل يوميًا 9 مساءً

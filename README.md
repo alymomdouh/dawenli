@@ -67,6 +67,37 @@
 
 ---
 
+## النشر على Vercel (Turso)
+
+النسخة دي معمّالة لـ serverless: الداتابيز على **Turso (libSQL)**، والجلسات
+وعدّاد محاولات الدخول متخزّنين في الداتابيز مش في الذاكرة (على Vercel كل
+طلب بيعمل instance جديد، فالـ `Map` كانت هتتساب كل مرة).
+
+```bash
+npm i -g vercel
+vercel link
+vercel env add TURSO_DATABASE_URL production     # من Turso dashboard
+vercel env add TURSO_AUTH_TOKEN  production
+vercel env add CRON_SECRET       production     # openssl rand -hex 32
+vercel env add DASHBOARD_PASSWORD production
+vercel --prod
+```
+
+**قبل أول نشر**، انقل بياناتك القديمة (لو عندك مستخدمين):
+
+```bash
+node scripts/migrate-to-turso.js --dry-run   # بيبص من غير ما يكتب
+node scripts/migrate-to-turso.js             # ينفّذ الترحيل
+```
+
+السكربت بينسخ كل الجداول مع الحفاظ على الـ `id` والـ `password_hash`، فلن
+تضطر تعمل حسابات من جديد. تشغيله تاني آمن (`INSERT OR REPLACE`).
+
+التذكيرات (check-in / تذكير المهام / التأمّل) بتيجي من **Vercel Cron** على
+`/api/cron` كل ساعة. لو `CRON_SECRET` مش متظبّط الـ endpoint بيرجّع 503.
+
+---
+
 ## النشر على VPS
 
 ```bash
@@ -82,27 +113,36 @@ pm2 save && pm2 startup
 التطبيق **ويب**، فمحتاج يبقى وراه دومين + شهادة SSL (Nginx مثلًا) — الـPWA وإشعارات الـWeb Push
 **مش بتشتغل غير على HTTPS**.
 
+> ملاحظة: على VPS سيب `TURSO_DATABASE_URL` فاضي وهيشتغل بملف محلي `file:` عادي.
+> scheduler بيشتغل بـ `setInterval` كالمعتاد؛ على Vercel بيتعطّل تلقائيًا
+> لأن التذكير بيجي من الـ cron.
+
 ---
 
 ## الهيكل
 
 ```
 src/
-  index.js           تشغيل السيرفر + الجدولة
+  index.js           تشغيل السيرفر + الجدولة (محليًا)
   config.js          متغيّرات البيئة
-  db.js              تخزين SQLite (multi-user + مهام + فئات صرف)
+  db.js              الداتابيز (Turso/libSQL — async بالكامل)
+  sqlite.js          adapter بيحاكي واجهة better-sqlite3 فوق libSQL
   openai.js          تفريغ الصوت + التحليل + التقرير الشامل
   agent.js           🧠 الـ Agent: الأدوات + حلقة tool calling
   report.js          تجميع بيانات التقرير الشامل
   server.js          API + جلسات + لوحة الأدمن
   push.js            إشعارات Web Push (VAPID)
   scheduler.js       الـ check-in اليومي والتأمّل الأسبوعي
-  updater.js         تحديث النسخة من لوحة الأدمن
-public/              واجهة الـPWA (RTL): تقويم، body map، مزاج، بنود صرف
+  updater.js         تحديث النسخة من لوحة الأدمن (محلي فقط)
+api/
+  index.js           نقطة دخول Vercel (بيصدّر Express app)
+  cron.js            Vercel Cron — بينفّذ دورة التذكيرات
+web/                 واجهة الـPWA (RTL): تقويم، body map، مزاج، بنود صرف
 scripts/
+  migrate-to-turso.js ترحيل البيانات القديمة → Turso
   backup-db.js       باك أب لقاعدة البيانات
   reset-password.js  إعادة تعيين كلمة سر مستخدم
-data/                قاعدة البيانات (SQLite)
+data/                قاعدة البيانات المحلية (gitignored)
 ```
 
 ## الموديلات والتكلفة (تقريبية)

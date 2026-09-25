@@ -110,6 +110,12 @@ import {
   deleteAsset,
   getAssetMarket,
   setAssetMarket,
+  createSession,
+  getSession,
+  deleteSession,
+  purgeExpiredSessions,
+  rateLimitBump,
+  purgeRateLimits,
 } from "./db.js";
 import { pushEnabled, vapidPublicKey, sendPushToUser, notifyUser } from "./push.js";
 import { analyzeEntries, doctorReport, unifiedReport, transcribe, PRICING, chatAboutJournal, classifyImage, textToSpeech, PROVIDERS, aiSettings, saveAiSettings, aiConfigured, aiErrorMessage, refreshAi, chatModel } from "./openai.js";
@@ -119,7 +125,10 @@ import { buildReportData } from "./report.js";
 import { runAgent } from "./agent.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const publicDir = join(__dirname, "..", "public");
+// مجلد الواجهة سُمّي web بدل public عن قصد: Vercel بيقدّم أي مجلد اسمه
+// public تلقائيًا كملفات ثابتة من غير ما يمر على السيرفر، وده كان هيعطّل
+// الـ auth gate على app.js و admin.js.
+const publicDir = join(__dirname, "..", "web");
 const uploadsDir = join(__dirname, "..", "data", "uploads"); // ملفات المستخدمين المرفوعة
 
 // نحفظ الصوت الخام فور وصوله — لو التفريغ فشل ميضيعش (نقدر نسترجعه من data/uploads/<user>/voice)
@@ -137,24 +146,22 @@ function cleanupAudio(p) { if (p) { try { unlinkSync(p); } catch {} } }
 /* ===================== الجلسات ===================== */
 
 const SESSION_TTL = 30 * 86400 * 1000;
-const sessions = new Map(); // token -> { userId, expiresAt }
-
-function newSession(userId) {
+async function newSession(userId) {
   const token = crypto.randomBytes(24).toString("hex");
-  sessions.set(token, { userId, expiresAt: Date.now() + SESSION_TTL });
+  await createSession(token, "user", userId, Date.now() + SESSION_TTL);
   return token;
 }
 
-function sessionUser(req) {
+async function sessionUser(req) {
   const token = parseCookies(req).dawenli_session;
   if (!token) return null;
-  const s = sessions.get(token);
-  if (!s) return null;
-  if (Date.now() > s.expiresAt) {
-    sessions.delete(token);
+  const s = await getSession(token);
+  if (!s || s.kind !== "user") return null;
+  if (Date.now() > s.expires_at) {
+    await deleteSession(token);
     return null;
   }
-  return getUserById(s.userId);
+  return (await getUserById(s.subject_id));
 }
 
 function parseCookies(req) {
@@ -170,23 +177,21 @@ function parseCookies(req) {
 
 /* ===================== جلسات الأدمن (منفصلة تمامًا عن المستخدمين) ===================== */
 
-const adminSessions = new Map(); // token -> { adminId, expiresAt }
-
-function newAdminSession(adminId) {
+async function newAdminSession(adminId) {
   const token = crypto.randomBytes(24).toString("hex");
-  adminSessions.set(token, { adminId, expiresAt: Date.now() + SESSION_TTL });
+  await createSession(token, "admin", adminId, Date.now() + SESSION_TTL);
   return token;
 }
-function sessionAdmin(req) {
+async function sessionAdmin(req) {
   const token = parseCookies(req).dawenli_admin;
   if (!token) return null;
-  const s = adminSessions.get(token);
-  if (!s) return null;
-  if (Date.now() > s.expiresAt) {
-    adminSessions.delete(token);
+  const s = await getSession(token);
+  if (!s || s.kind !== "admin") return null;
+  if (Date.now() > s.expires_at) {
+    await deleteSession(token);
     return null;
   }
-  return getAdminById(s.adminId);
+  return (await getAdminById(s.subject_id));
 }
 
 /* ===================== كلمات السر (scrypt — من غير مكتبات) ===================== */
@@ -210,33 +215,26 @@ function verifyPassword(pw, stored) {
 
 /* ===================== السيرفر ===================== */
 
-/* ===================== Rate limiting (in-memory, per-IP) ===================== */
-// نافذة ثابتة بسيطة — تكفي لمنع تخمين كلمات السر من غير مكتبات.
-const rlBuckets = new Map(); // key -> { count, resetAt }
+/* ===================== Async error handling (Express 4 بيلهمل الـ rejections) ===================== */
+// Express 4 مش بيمسك الأخطاء اللي جاية من async handler — بتشتغل زي exception عادي
+// وبتوقّف العملية كلها. ده كان سبب السيرفر إنه يقع عند أول خطأ في قاعدة البيانات.
+const ah = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
+/* ===================== Rate limiting (في الداتابيز — يشتغل على Vercel) ===================== */
+// كان Map في الذاكرة: على Vercel كل cold start كان بيصفّر العداد، يعني الحماية
+// من تخمين كلمات السر بتختفي تمامًا. دلوقتي العداد متخزّن ومش بيعتمد على instance.
 function rateLimit({ bucket, max, windowMs }) {
-  return (req, res, next) => {
+  return ah(async (req, res, next) => {
     const ip = (req.headers["x-forwarded-for"]?.split(",")[0] || req.socket.remoteAddress || "?").trim();
-    const key = `${bucket}:${ip}`;
-    const nowMs = Date.now();
-    let entry = rlBuckets.get(key);
-    if (!entry || nowMs > entry.resetAt) {
-      entry = { count: 0, resetAt: nowMs + windowMs };
-      rlBuckets.set(key, entry);
-    }
-    entry.count++;
-    if (entry.count > max) {
-      const sec = Math.ceil((entry.resetAt - nowMs) / 1000);
+    const { count, resetAt } = await rateLimitBump(bucket, ip, windowMs);
+    if (count > max) {
+      const sec = Math.max(1, Math.ceil((resetAt - Date.now()) / 1000));
       res.setHeader("Retry-After", String(sec));
       return res.status(429).json({ error: `محاولات كتير — استنى ${sec} ثانية وجرّب تاني` });
     }
     next();
-  };
+  });
 }
-// تنظيف دوري للذاكرة
-setInterval(() => {
-  const t = Date.now();
-  for (const [k, v] of rlBuckets) if (t > v.resetAt) rlBuckets.delete(k);
-}, 10 * 60 * 1000).unref?.();
 
 const loginLimiter = rateLimit({ bucket: "login", max: 8, windowMs: 10 * 60 * 1000 }); // 8 / 10د
 const voiceLimiter = rateLimit({ bucket: "voice", max: 40, windowMs: 10 * 60 * 1000 });
@@ -248,38 +246,51 @@ const ALLOWED_UPLOAD = new Set([
 ]);
 
 // باني سياق "اسأل دوّنلي" حسب النطاق المختار — مستخدم في الشات النصي والصوتي.
-function buildAskContext(userId, scope, date, from, to) {
+async function buildAskContext(userId, scope, date, from, to) {
   const journalCtx = (rows) =>
     rows.map((e) => `📅 ${e.entry_date}${e.mood ? ` (${e.mood})` : ""}: ${e.transcript || e.summary || ""}`).join("\n\n");
   switch (scope) {
-    case "day": return journalCtx(entriesBetween(userId, date, date));
-    case "range": return journalCtx(entriesBetween(userId, from, to));
+    case "day": return journalCtx((await entriesBetween(userId, date, date)));
+    case "range": return journalCtx((await entriesBetween(userId, from, to)));
     case "finance":
-      return listFinance(userId, 500).map((f) => `📅 ${f.entry_date} ${f.direction === "income" ? "دخل" : "صرف"} ${f.amount} ${f.currency || "جنيه"}${f.category ? " · " + f.category : ""}${f.note ? " · " + f.note : ""}`).join("\n");
+      return (await listFinance(userId, 500)).map((f) => `📅 ${f.entry_date} ${f.direction === "income" ? "دخل" : "صرف"} ${f.amount} ${f.currency || "جنيه"}${f.category ? " · " + f.category : ""}${f.note ? " · " + f.note : ""}`).join("\n");
     case "health":
-      return listHealth(userId, 500).map((h) => `📅 ${h.entry_date} [${h.category}] ${h.detail}${h.body_region && h.body_region !== "عام" ? " (" + h.body_region + ")" : ""}`).join("\n");
+      return (await listHealth(userId, 500)).map((h) => `📅 ${h.entry_date} [${h.category}] ${h.detail}${h.body_region && h.body_region !== "عام" ? " (" + h.body_region + ")" : ""}`).join("\n");
     case "mental":
-      return listHealth(userId, 500).filter((h) => h.category === "نفسية").map((h) => `📅 ${h.entry_date}: ${h.detail}`).join("\n");
+      return (await listHealth(userId, 500)).filter((h) => h.category === "نفسية").map((h) => `📅 ${h.entry_date}: ${h.detail}`).join("\n");
     case "goals":
-      return listGoals(userId).map((g) => `🎯 ${g.title}: ${g.current}${g.target ? " / " + g.target : ""}${g.unit ? " " + g.unit : ""}`).join("\n");
+      return (await listGoals(userId)).map((g) => `🎯 ${g.title}: ${g.current}${g.target ? " / " + g.target : ""}${g.unit ? " " + g.unit : ""}`).join("\n");
     case "habits":
-      return listHabits(userId).map((h) => `🔁 ${h.title} (${h.kind === "quit" ? "بيبطّلها" : "بيعملها"}) — ستريك ${h.streak}، اتعملت ${h.total} مرة`).join("\n");
+      return (await listHabits(userId)).map((h) => `🔁 ${h.title} (${h.kind === "quit" ? "بيبطّلها" : "بيعملها"}) — ستريك ${h.streak}، اتعملت ${h.total} مرة`).join("\n");
     case "tasks":
-      return listTasks(userId, "0000-01-01", "9999-12-31").map((t) => `📌 ${t.due_date}${t.due_time ? " " + t.due_time : ""} — ${t.title} [${t.status === "done" ? "اتعملت" : "لسه"}]`).join("\n");
+      return (await listTasks(userId, "0000-01-01", "9999-12-31")).map((t) => `📌 ${t.due_date}${t.due_time ? " " + t.due_time : ""} — ${t.title} [${t.status === "done" ? "اتعملت" : "لسه"}]`).join("\n");
     case "meals":
-      return listMeals(userId, 500).map((m) => `🍽️ ${m.entry_date}${m.at_time ? " " + m.at_time : ""}: ${m.items}${m.note ? " · " + m.note : ""}`).join("\n");
+      return (await listMeals(userId, 500)).map((m) => `🍽️ ${m.entry_date}${m.at_time ? " " + m.at_time : ""}: ${m.items}${m.note ? " · " + m.note : ""}`).join("\n");
     case "ideas":
-      return listIdeas(userId).map((i) => `💡 ${i.title}${i.detail ? " — " + i.detail : ""} [${i.status}]`).join("\n");
+      return (await listIdeas(userId)).map((i) => `💡 ${i.title}${i.detail ? " — " + i.detail : ""} [${i.status}]`).join("\n");
     case "problems":
-      return listProblems(userId).map((p) => `🧩 ${p.title}${p.detail ? " — " + p.detail : ""} [${p.area || "-"}/${p.status}]`).join("\n");
+      return (await listProblems(userId)).map((p) => `🧩 ${p.title}${p.detail ? " — " + p.detail : ""} [${p.area || "-"}/${p.status}]`).join("\n");
     default:
-      return journalCtx(listEntries(userId, 500));
+      return journalCtx((await listEntries(userId, 500)));
   }
 }
 
-export function startServer() {
+export async function createApp() {
   const app = express();
   app.disable("x-powered-by");
+
+  // Express 4 بيلهمل الـ rejected promises من الـ async handlers: أي error جاي من
+  // قاعدة البيانات كان بيطلع exception عادي وبيقتل الـ process كله. بنلف كل
+  // الـ handlers أوتوماتيك عشان كل error يروح للـ error middleware في الآخر.
+  // (handlers بـ 4 args هي error middleware — بنسيبها زي ما هي)
+  for (const m of ["get", "post", "put", "patch", "delete", "all", "use"]) {
+    const orig = app[m].bind(app);
+    app[m] = (path, ...rest) =>
+      orig(
+        path,
+        ...rest.map((h) => (typeof h === "function" && h.length !== 4 && !h.__ah ? Object.assign(ah(h), { __ah: true }) : h))
+      );
+  }
 
   // هيدرات أمان أساسية على كل الردود
   app.use((req, res, next) => {
@@ -313,54 +324,59 @@ export function startServer() {
   // JSON صغيرة للـ API العادي؛ الصوت ليه parser منفصل (raw) في endpoint بتاعه
   app.use(express.json({ limit: "64kb" }));
 
-  function openSession(res, userId, remember) {
-    const token = newSession(userId);
+  // على Vercel كل النداءات HTTPS، فالكوكي لازم Secure. على localhost
+  // (http) بنسيبها من غير Secure وإلا المتصفح مش هيبعت الكوكي أصلاً.
+  const secure = config.isServerless ? "; Secure" : "";
+
+  async function openSession(res, userId, remember) {
+    const token = await newSession(userId);
     const maxAge = remember === false ? "" : `; Max-Age=${30 * 86400}`;
     res.setHeader(
       "Set-Cookie",
-      `dawenli_session=${token}; HttpOnly; SameSite=Strict; Path=/${maxAge}`
+      `dawenli_session=${token}; HttpOnly; SameSite=Strict; Path=/${maxAge}${secure}`
     );
   }
 
   // bootstrap: أول أدمن من DASHBOARD_PASSWORD (يوزر: admin) لو مفيش أدمنز
-  if (countAdmins() === 0 && config.dashboardPassword) {
-    createAdmin({ username: "admin", passwordHash: hashPassword(config.dashboardPassword) });
+  if ((await countAdmins()) === 0 && config.dashboardPassword) {
+    (await createAdmin({ username: "admin", passwordHash: hashPassword(config.dashboardPassword) }));
     console.log("👤 اتعمل أدمن افتراضي: admin (الباسورد = DASHBOARD_PASSWORD) — غيّره بعد أول دخول");
   }
 
-  function openAdminSession(res, adminId, remember) {
-    const token = newAdminSession(adminId);
+  async function openAdminSession(res, adminId, remember) {
+    const token = await newAdminSession(adminId);
     const maxAge = remember === false ? "" : `; Max-Age=${30 * 86400}`;
-    res.setHeader("Set-Cookie", `dawenli_admin=${token}; HttpOnly; SameSite=Strict; Path=/${maxAge}`);
+    res.setHeader("Set-Cookie", `dawenli_admin=${token}; HttpOnly; SameSite=Strict; Path=/${maxAge}${secure}`);
   }
 
   // دخول المستخدمين: إيميل + باسورد (مفيش أدمن هنا)
-  app.post("/api/login", loginLimiter, (req, res) => {
+  app.post("/api/login", loginLimiter, async (req, res) => {
     const { email, password, remember } = req.body || {};
     let userId = null;
     if (email && password) {
-      const user = getUserByEmail(email);
+      const user = (await getUserByEmail(email));
       if (user?.password_hash && verifyPassword(password, user.password_hash)) userId = user.id;
     }
     if (!userId) return res.status(401).json({ ok: false, error: "بيانات الدخول غلط" });
-    openSession(res, userId, remember);
+    (await openSession(res, userId, remember));
     return res.json({ ok: true });
   });
 
   /* ===== دخول الأدمن (منفصل) ===== */
-  app.post("/api/admin/login", loginLimiter, (req, res) => {
+  app.post("/api/admin/login", loginLimiter, async (req, res) => {
     const { username, password, remember } = req.body || {};
-    const admin = getAdminByUsername(username);
+    const admin = (await getAdminByUsername(username));
     if (!admin || !verifyPassword(password || "", admin.password_hash)) {
       return res.status(401).json({ ok: false, error: "اسم المستخدم أو كلمة السر غلط" });
     }
-    touchAdminLogin(admin.id);
-    openAdminSession(res, admin.id, remember);
+    (await touchAdminLogin(admin.id));
+    (await openAdminSession(res, admin.id, remember));
     return res.json({ ok: true });
   });
-  app.post("/api/admin/logout", (req, res) => {
-    adminSessions.delete(parseCookies(req).dawenli_admin);
-    res.setHeader("Set-Cookie", "dawenli_admin=; HttpOnly; Path=/; Max-Age=0");
+  app.post("/api/admin/logout", async (req, res) => {
+    const t = parseCookies(req).dawenli_admin;
+    if (t) (await deleteSession(t));
+    res.setHeader("Set-Cookie", `dawenli_admin=; HttpOnly; Path=/; Max-Age=0${secure}`);
     res.json({ ok: true });
   });
 
@@ -370,9 +386,10 @@ export function startServer() {
     return res.status(403).json({ ok: false, error: "التسجيل مقفول — تواصل مع الأدمن عشان يفتحلك حساب" });
   });
 
-  app.post("/api/logout", (req, res) => {
-    sessions.delete(parseCookies(req).dawenli_session);
-    res.setHeader("Set-Cookie", "dawenli_session=; HttpOnly; Path=/; Max-Age=0");
+  app.post("/api/logout", async (req, res) => {
+    const t = parseCookies(req).dawenli_session;
+    if (t) (await deleteSession(t));
+    res.setHeader("Set-Cookie", `dawenli_session=; HttpOnly; Path=/; Max-Age=0${secure}`);
     res.json({ ok: true });
   });
 
@@ -392,44 +409,44 @@ export function startServer() {
     res.sendFile(join(publicDir, "sw.js"));
   });
 
-  app.get(["/login", "/login.html"], (req, res) => {
-    if (sessionUser(req)) return res.redirect("/");
+  app.get(["/login", "/login.html"], async (req, res) => {
+    if ((await sessionUser(req))) return res.redirect("/");
     res.sendFile(join(publicDir, "login.html"));
   });
 
-  app.get(["/landing", "/landing.html", "/welcome"], (req, res) => {
+  app.get(["/landing", "/landing.html", "/welcome"], async (req, res) => {
     // اللي مسجّل دخول مايشوفش صفحة الهبوط — يروح الداشبورد على طول
-    if (sessionUser(req)) return res.redirect("/");
+    if ((await sessionUser(req))) return res.redirect("/");
     res.sendFile(join(publicDir, "landing.html"));
   });
 
   // محمي: السكربت والصفحة والبيانات
-  app.get("/app.js", (req, res) =>
-    sessionUser(req) ? res.sendFile(join(publicDir, "app.js")) : res.status(401).end()
+  app.get("/app.js", async (req, res) =>
+    (await sessionUser(req)) ? res.sendFile(join(publicDir, "app.js")) : res.status(401).end()
   );
 
-  app.get("/", (req, res) => {
+  app.get("/", async (req, res) => {
     // الزائر الجديد يشوف صفحة الهبوط (وفيها «نزّل التطبيق») أول حاجة؛ المسجّل يدخل الداشبورد.
-    if (!sessionUser(req)) return res.redirect("/landing");
+    if (!(await sessionUser(req))) return res.redirect("/landing");
     res.sendFile(join(publicDir, "index.html"));
   });
 
   /* ===== صفحات الأدمن ===== */
-  app.get(["/admin/login", "/admin-login.html"], (req, res) => {
-    if (sessionAdmin(req)) return res.redirect("/admin");
+  app.get(["/admin/login", "/admin-login.html"], async (req, res) => {
+    if ((await sessionAdmin(req))) return res.redirect("/admin");
     res.sendFile(join(publicDir, "admin-login.html"));
   });
-  app.get("/admin.js", (req, res) =>
-    sessionAdmin(req) ? res.sendFile(join(publicDir, "admin.js")) : res.status(401).end()
+  app.get("/admin.js", async (req, res) =>
+    (await sessionAdmin(req)) ? res.sendFile(join(publicDir, "admin.js")) : res.status(401).end()
   );
-  app.get(["/admin", "/admin.html"], (req, res) => {
-    if (!sessionAdmin(req)) return res.redirect("/admin/login");
+  app.get(["/admin", "/admin.html"], async (req, res) => {
+    if (!(await sessionAdmin(req))) return res.redirect("/admin/login");
     res.sendFile(join(publicDir, "admin.html"));
   });
 
   // gate: بيرجّع المستخدم بتاع الجلسة أو بيقفل الطلب
-  const gate = (req, res) => {
-    const user = sessionUser(req);
+  const gate = async (req, res) => {
+    const user = (await sessionUser(req));
     if (!user) {
       res.status(401).json({ error: "غير مصرّح" });
       return null;
@@ -438,8 +455,8 @@ export function startServer() {
   };
 
   // adminGate: للـ endpoints الخاصة بلوحة الأدمن
-  const adminGate = (req, res) => {
-    const admin = sessionAdmin(req);
+  const adminGate = async (req, res) => {
+    const admin = (await sessionAdmin(req));
     if (!admin) {
       res.status(401).json({ error: "غير مصرّح" });
       return null;
@@ -449,39 +466,39 @@ export function startServer() {
   // ownerGate: الأدمن أو صاحب التطبيق (is_owner) — عشان صاحب التطبيق يظبّط مزود
   // الذكاء والتحديثات من جوّه التطبيق من غير ما يسجّل دخول تاني في لوحة الأدمن.
   // المستخدمين العاديين مايوصلوش (دي إعدادات بتأثر على التطبيق كله).
-  const ownerGate = (req, res) => {
-    if (sessionAdmin(req)) return { kind: "admin" };
-    const user = sessionUser(req);
+  const ownerGate = async (req, res) => {
+    if ((await sessionAdmin(req))) return { kind: "admin" };
+    const user = (await sessionUser(req));
     if (user?.is_owner) return { kind: "owner", user };
     res.status(403).json({ error: "الإعدادات دي لصاحب التطبيق بس" });
     return null;
   };
 
   /* ===== API الأدمن ===== */
-  app.get("/api/admin/me", (req, res) => {
-    const admin = adminGate(req, res);
+  app.get("/api/admin/me", async (req, res) => {
+    const admin = (await adminGate(req, res));
     if (!admin) return;
     res.json({ username: admin.username, lastLogin: admin.last_login });
   });
-  app.get("/api/admin/overview", (req, res) => {
-    const admin = adminGate(req, res);
+  app.get("/api/admin/overview", async (req, res) => {
+    const admin = (await adminGate(req, res));
     if (!admin) return;
     res.json({
-      stats: platformStats(),
-      users: listUsersWithStats(),
-      usage: aiUsageSummary(30),
+      stats: (await platformStats()),
+      users: (await listUsersWithStats()),
+      usage: (await aiUsageSummary(30)),
       pricing: PRICING,
     });
   });
   /* ===== تحديثات التطبيق من الجيت ===== */
-  app.get("/api/admin/version", async (req, res) => {
-    if (!ownerGate(req, res)) return;
+  app.get("/api/admin/version",  async (req, res) => {
+    if (!(await ownerGate(req, res))) return;
     // check=0 → قراءة سريعة من غير ما نضرب على الريبو (للعرض الأولي)
     res.json(await versionStatus({ checkRemote: req.query.check !== "0" }));
   });
   let _updating = false;
-  app.post("/api/admin/update", async (req, res) => {
-    if (!ownerGate(req, res)) return;
+  app.post("/api/admin/update",  async (req, res) => {
+    if (!(await ownerGate(req, res))) return;
     if (_updating) return res.status(409).json({ ok: false, error: "فيه تحديث شغّال دلوقتي — استنى شوية" });
     _updating = true;
     try {
@@ -500,8 +517,8 @@ export function startServer() {
   });
 
   /* ===== إعدادات مزود الذكاء (OpenAI / Gemini / Grok / مخصص) ===== */
-  app.get("/api/admin/ai-settings", (req, res) => {
-    if (!ownerGate(req, res)) return;
+  app.get("/api/admin/ai-settings", async (req, res) => {
+    if (!(await ownerGate(req, res))) return;
     const s = aiSettings();
     res.json({
       configured: !!s.apiKey,
@@ -517,8 +534,8 @@ export function startServer() {
       ),
     });
   });
-  app.put("/api/admin/ai-settings", (req, res) => {
-    if (!ownerGate(req, res)) return;
+  app.put("/api/admin/ai-settings", async (req, res) => {
+    if (!(await ownerGate(req, res))) return;
     const { provider, api_key, model, base_url, voice_key } = req.body || {};
     if (!PROVIDERS[provider]) return res.status(400).json({ error: "اختار مزود صحيح" });
     const existing = aiSettings();
@@ -535,8 +552,8 @@ export function startServer() {
     res.json({ ok: true });
   });
   // اختبار حي: بيكلم المزود فعلاً بمفتاح/موديل الفورم (من غير حفظ) أو بالمحفوظ لو الفورم فاضي
-  app.post("/api/admin/ai-settings/test", async (req, res) => {
-    if (!ownerGate(req, res)) return;
+  app.post("/api/admin/ai-settings/test",  async (req, res) => {
+    if (!(await ownerGate(req, res))) return;
     const { provider, api_key, model, base_url } = req.body || {};
     const saved = aiSettings();
     const p = PROVIDERS[provider || saved.provider] || PROVIDERS.openai;
@@ -559,101 +576,101 @@ export function startServer() {
   });
 
   // إنشاء حساب مستخدم من الأدمن (التسجيل العام مقفول)
-  app.post("/api/admin/users", (req, res) => {
-    const admin = adminGate(req, res);
+  app.post("/api/admin/users", async (req, res) => {
+    const admin = (await adminGate(req, res));
     if (!admin) return;
     const { name, email, password } = req.body || {};
     const cleanEmail = String(email || "").trim().toLowerCase();
     if (!/^\S+@\S+\.\S+$/.test(cleanEmail)) return res.status(400).json({ error: "اكتب إيميل صحيح" });
     if (!password || String(password).length < 6) return res.status(400).json({ error: "كلمة السر لازم ٦ حروف على الأقل" });
-    const user = createEmailUser({
+    const user = (await createEmailUser({
       name: String(name || "").trim() || null,
       email: cleanEmail,
       passwordHash: hashPassword(password),
-    });
+    }));
     if (!user) return res.status(409).json({ error: "الإيميل ده متسجّل قبل كده" });
     res.json({ ok: true, user: { id: user.id, email: cleanEmail, name: user.name } });
   });
   // تحويل ملكية التطبيق لحساب (المالك بيقدر يظبّط الذكاء والتحديثات من جوّه التطبيق)
-  app.put("/api/admin/users/:id/owner", (req, res) => {
-    const admin = adminGate(req, res);
+  app.put("/api/admin/users/:id/owner", async (req, res) => {
+    const admin = (await adminGate(req, res));
     if (!admin) return;
     const id = Number(req.params.id);
-    const target = getUserById(id);
+    const target = (await getUserById(id));
     if (!target) return res.status(404).json({ error: "الحساب مش موجود" });
     const makeOwner = !!(req.body || {}).is_owner;
     if (makeOwner && !target.email) return res.status(400).json({ error: "الحساب ده مالوش إيميل فمينفعش يسجّل دخول" });
-    if (!makeOwner && countLoginableOwners() <= 1 && target.is_owner)
+    if (!makeOwner && (await countLoginableOwners()) <= 1 && target.is_owner)
       return res.status(400).json({ error: "ده آخر صاحب للتطبيق — عيّن واحد تاني الأول" });
-    res.json({ ok: setUserOwner(id, makeOwner) });
+    res.json({ ok: (await setUserOwner(id, makeOwner)) });
   });
   // تفاصيل مستخدم واحد (قراءة فقط للمراقبة)
-  app.get("/api/admin/users/:id", (req, res) => {
-    const admin = adminGate(req, res);
+  app.get("/api/admin/users/:id", async (req, res) => {
+    const admin = (await adminGate(req, res));
     if (!admin) return;
     const uid = Number(req.params.id);
-    const u = getUserById(uid);
+    const u = (await getUserById(uid));
     if (!u) return res.status(404).json({ error: "المستخدم مش موجود" });
     res.json({
       user: { id: u.id, name: u.name, email: u.email, last_seen: u.last_seen, created_at: u.created_at, is_owner: !!u.is_owner },
-      entries: listEntries(uid, 30),
-      finance: listFinance(uid, 50),
-      health: listHealth(uid, 50),
-      goals: listGoals(uid),
-      habits: listHabits(uid),
-      tasks: listTasks(uid, "0000-01-01", "9999-12-31"),
-      profile: listProfileFacts(uid),
+      entries: (await listEntries(uid, 30)),
+      finance: (await listFinance(uid, 50)),
+      health: (await listHealth(uid, 50)),
+      goals: (await listGoals(uid)),
+      habits: (await listHabits(uid)),
+      tasks: (await listTasks(uid, "0000-01-01", "9999-12-31")),
+      profile: (await listProfileFacts(uid)),
     });
   });
 
-  app.get("/api/me", (req, res) => {
-    const user = gate(req, res);
+  app.get("/api/me", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
     res.json({
       id: user.id,
       name: user.name,
       isOwner: !!user.is_owner,
-      today: localToday(),
+      today: (await localToday()),
     });
   });
   // تكلفة المستخدم على الذكاء الاصطناعي — يظهر له في الرئيسية
-  app.get("/api/my-usage", (req, res) => {
-    const user = gate(req, res);
+  app.get("/api/my-usage", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    res.json(userUsageCost(user.id));
+    res.json((await userUsageCost(user.id)));
   });
   // تفاصيل تكلفة الـ AI للمستخدم نفسه (مقسّمة بالنوع)
-  app.get("/api/my-usage/details", (req, res) => {
-    const user = gate(req, res);
+  app.get("/api/my-usage/details", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    res.json({ ...userUsageDetails(user.id), pricing: PRICING, usdEgp: getAssetMarket()?.rates?.USD || null });
+    res.json({ ...userUsageDetails(user.id), pricing: PRICING, usdEgp: (await getAssetMarket())?.rates?.USD || null });
   });
 
   /* ===== إشعارات PWA (Web Push) ===== */
   // مفتاح VAPID العام — العميل بيستخدمه عشان يعمل subscribe
-  app.get("/api/push/key", (req, res) => {
-    if (!gate(req, res)) return;
+  app.get("/api/push/key", async (req, res) => {
+    if (!(await gate(req, res))) return;
     res.json({ enabled: pushEnabled, key: pushEnabled ? vapidPublicKey : null });
   });
   // تسجيل اشتراك جهاز
-  app.post("/api/push/subscribe", (req, res) => {
-    const user = gate(req, res);
+  app.post("/api/push/subscribe", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
     if (!pushEnabled) return res.status(503).json({ error: "push_disabled" });
-    const ok = savePushSubscription(user.id, req.body);
+    const ok = (await savePushSubscription(user.id, req.body));
     if (!ok) return res.status(400).json({ error: "bad_subscription" });
     res.json({ ok: true });
   });
   // إلغاء اشتراك جهاز
-  app.post("/api/push/unsubscribe", (req, res) => {
-    const user = gate(req, res);
+  app.post("/api/push/unsubscribe", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    deletePushSubscription(req.body?.endpoint);
+    (await deletePushSubscription(req.body?.endpoint));
     res.json({ ok: true });
   });
   // إشعار تجريبي للمستخدم الحالي (بيتخزّن في الجرس كمان)
-  app.post("/api/push/test", async (req, res) => {
-    const user = gate(req, res);
+  app.post("/api/push/test",  async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
     const sent = await notifyUser(user.id, {
       title: "دوّنلي ✍️",
@@ -665,155 +682,155 @@ export function startServer() {
   });
 
   /* ===== إشعارات داخل التطبيق (الجرس) ===== */
-  app.get("/api/notifications", (req, res) => {
-    const user = gate(req, res);
+  app.get("/api/notifications", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
     res.json({
-      items: listNotifications(user.id, 30),
-      unread: unreadNotificationCount(user.id),
+      items: (await listNotifications(user.id, 30)),
+      unread: (await unreadNotificationCount(user.id)),
     });
   });
-  app.post("/api/notifications/read", (req, res) => {
-    const user = gate(req, res);
+  app.post("/api/notifications/read", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    markNotificationsRead(user.id, req.body?.id || null);
-    res.json({ ok: true, unread: unreadNotificationCount(user.id) });
+    (await markNotificationsRead(user.id, req.body?.id || null));
+    res.json({ ok: true, unread: (await unreadNotificationCount(user.id)) });
   });
 
   /* ===== الأقسام ===== */
-  app.get("/api/entries", (req, res) => {
-    const user = gate(req, res);
+  app.get("/api/entries", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    res.json(listEntries(user.id, 500));
+    res.json((await listEntries(user.id, 500)));
   });
-  app.get("/api/finance", (req, res) => {
-    const user = gate(req, res);
+  app.get("/api/finance", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    res.json(listFinance(user.id, 500));
+    res.json((await listFinance(user.id, 500)));
   });
-  app.get("/api/health", (req, res) => {
-    const user = gate(req, res);
+  app.get("/api/health", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    res.json(listHealth(user.id, 500));
+    res.json((await listHealth(user.id, 500)));
   });
-  app.get("/api/goals", (req, res) => {
-    const user = gate(req, res);
+  app.get("/api/goals", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    res.json(listGoals(user.id));
+    res.json((await listGoals(user.id)));
   });
-  app.get("/api/conversations", (req, res) => {
-    const user = gate(req, res);
+  app.get("/api/conversations", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    res.json(listConversations(user.id, 500));
+    res.json((await listConversations(user.id, 500)));
   });
-  app.get("/api/conditions", (req, res) => {
-    const user = gate(req, res);
+  app.get("/api/conditions", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    res.json(listConditions(user.id));
+    res.json((await listConditions(user.id)));
   });
-  app.get("/api/meals", (req, res) => {
-    const user = gate(req, res);
+  app.get("/api/meals", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    res.json(listMeals(user.id, 500));
+    res.json((await listMeals(user.id, 500)));
   });
-  app.get("/api/habits", (req, res) => {
-    const user = gate(req, res);
+  app.get("/api/habits", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    res.json(listHabits(user.id));
+    res.json((await listHabits(user.id)));
   });
 
   /* ===== الذاكرة الدائمة (دوّنلي يعرف عنك) ===== */
-  app.get("/api/profile", (req, res) => {
-    const user = gate(req, res);
+  app.get("/api/profile", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    res.json(listProfileFacts(user.id));
+    res.json((await listProfileFacts(user.id)));
   });
-  app.post("/api/profile", (req, res) => {
-    const user = gate(req, res);
+  app.post("/api/profile", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
     const { category, key, value } = req.body || {};
     if (!key || !value) return res.status(400).json({ error: "المفتاح والقيمة مطلوبين" });
-    res.json({ ok: true, fact: upsertProfileFact({ userId: user.id, category, key, value }) });
+    res.json({ ok: true, fact: (await upsertProfileFact({ userId: user.id, category, key, value })) });
   });
-  app.delete("/api/profile/:id", (req, res) => {
-    const user = gate(req, res);
+  app.delete("/api/profile/:id", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    res.json({ ok: deleteProfileFact(user.id, Number(req.params.id)) });
+    res.json({ ok: (await deleteProfileFact(user.id, Number(req.params.id))) });
   });
 
   /* ===== المهام والتقويم ===== */
-  app.get("/api/tasks", (req, res) => {
-    const user = gate(req, res);
+  app.get("/api/tasks", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
     const from = String(req.query.from || "0000-01-01");
     const to = String(req.query.to || "9999-12-31");
-    res.json(listTasks(user.id, from, to));
+    res.json((await listTasks(user.id, from, to)));
   });
-  app.post("/api/tasks", (req, res) => {
-    const user = gate(req, res);
+  app.post("/api/tasks", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
     const { title, dueDate, dueTime, note, resources } = req.body || {};
     if (!title) return res.status(400).json({ error: "العنوان مطلوب" });
     // dueDate = "" → مهمة عامة من غير يوم (مسموح)
-    res.json({ ok: true, task: addTask({ userId: user.id, title, dueDate, dueTime, note, resources }) });
+    res.json({ ok: true, task: (await addTask({ userId: user.id, title, dueDate, dueTime, note, resources })) });
   });
-  app.put("/api/tasks/:id/done", (req, res) => {
-    const user = gate(req, res);
+  app.put("/api/tasks/:id/done", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    res.json({ ok: !!completeTask(user.id, { id: Number(req.params.id) }) });
+    res.json({ ok: !!(await completeTask(user.id, { id: Number(req.params.id) })) });
   });
-  app.put("/api/tasks/:id/reopen", (req, res) => {
-    const user = gate(req, res);
+  app.put("/api/tasks/:id/reopen", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    res.json({ ok: reopenTask(user.id, Number(req.params.id)) });
+    res.json({ ok: (await reopenTask(user.id, Number(req.params.id))) });
   });
-  app.delete("/api/tasks/:id", (req, res) => {
-    const user = gate(req, res);
+  app.delete("/api/tasks/:id", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    res.json({ ok: deleteTask(user.id, Number(req.params.id)) });
+    res.json({ ok: (await deleteTask(user.id, Number(req.params.id))) });
   });
 
   /* ===== الأفكار (دماغك) ===== */
-  app.get("/api/ideas", (req, res) => {
-    const user = gate(req, res);
+  app.get("/api/ideas", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    res.json(listIdeas(user.id));
+    res.json((await listIdeas(user.id)));
   });
-  app.post("/api/ideas", (req, res) => {
-    const user = gate(req, res);
+  app.post("/api/ideas", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
     const { title, detail } = req.body || {};
     if (!title) return res.status(400).json({ error: "اكتب الفكرة" });
-    res.json({ ok: true, idea: addIdea({ userId: user.id, title, detail }) });
+    res.json({ ok: true, idea: (await addIdea({ userId: user.id, title, detail })) });
   });
-  app.put("/api/ideas/:id/status", (req, res) => {
-    const user = gate(req, res);
+  app.put("/api/ideas/:id/status", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    res.json({ ok: setIdeaStatus(user.id, Number(req.params.id), String(req.body?.status || "")) });
+    res.json({ ok: (await setIdeaStatus(user.id, Number(req.params.id), String(req.body?.status || ""))) });
   });
 
   /* ===== المشاكل (قلبك) ===== */
-  app.get("/api/problems", (req, res) => {
-    const user = gate(req, res);
+  app.get("/api/problems", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    res.json(listProblems(user.id));
+    res.json((await listProblems(user.id)));
   });
-  app.post("/api/problems", (req, res) => {
-    const user = gate(req, res);
+  app.post("/api/problems", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
     const { title, detail, area } = req.body || {};
     if (!title) return res.status(400).json({ error: "اكتب المشكلة" });
-    res.json({ ok: true, problem: addProblem({ userId: user.id, title, detail, area }) });
+    res.json({ ok: true, problem: (await addProblem({ userId: user.id, title, detail, area })) });
   });
-  app.put("/api/problems/:id/status", (req, res) => {
-    const user = gate(req, res);
+  app.put("/api/problems/:id/status", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    res.json({ ok: setProblemStatus(user.id, Number(req.params.id), String(req.body?.status || ""), req.body?.note) });
+    res.json({ ok: (await setProblemStatus(user.id, Number(req.params.id), String(req.body?.status || ""), req.body?.note)) });
   });
 
   /* ===== اسأل دوّنلي (شات سياقي عن اليوميات — بيحافظ على الـ context) ===== */
-  app.post("/api/ask", async (req, res) => {
-    const user = gate(req, res);
+  app.post("/api/ask",  async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
     const { messages, scope, date, from, to, fast } = req.body || {};
     if (!Array.isArray(messages)) return res.status(400).json({ error: "اكتب رسالة" });
@@ -826,13 +843,13 @@ export function startServer() {
     const dateOk = (d) => /^\d{4}-\d{2}-\d{2}$/.test(String(d || ""));
     if ((scope === "day" && !dateOk(date)) || (scope === "range" && !(dateOk(from) && dateOk(to))))
       return res.status(400).json({ error: "اختار تاريخ صحيح الأول" });
-    const contextText = buildAskContext(user.id, scope, date, from, to);
+    const contextText = (await buildAskContext(user.id, scope, date, from, to));
     try {
       const reply = await chatAboutJournal({ messages: clean, contextText, userId: user.id, fast: !!fast });
       // نحفظ الرسالة الجديدة + الرد عشان المحادثة تفضل موجودة بعد الريلود
       const lastUser = [...clean].reverse().find((m) => m.role === "user");
-      if (lastUser) addAskMessage(user.id, "user", lastUser.content);
-      addAskMessage(user.id, "assistant", reply);
+      if (lastUser) (await addAskMessage(user.id, "user", lastUser.content));
+      (await addAskMessage(user.id, "assistant", reply));
       res.json({ reply });
     } catch (err) {
       console.error("ask error:", err);
@@ -841,15 +858,15 @@ export function startServer() {
     }
   });
   // تاريخ محادثة اسأل دوّنلي (محفوظ)
-  app.get("/api/ask/history", (req, res) => {
-    const user = gate(req, res);
+  app.get("/api/ask/history", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    res.json(listAskMessages(user.id, 200));
+    res.json((await listAskMessages(user.id, 200)));
   });
-  app.delete("/api/ask/history", (req, res) => {
-    const user = gate(req, res);
+  app.delete("/api/ask/history", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    clearAskMessages(user.id);
+    (await clearAskMessages(user.id));
     res.json({ ok: true });
   });
 
@@ -858,8 +875,8 @@ export function startServer() {
     "/api/ask/voice",
     voiceLimiter,
     express.raw({ type: ["audio/*", "application/octet-stream"], limit: "25mb" }),
-    async (req, res) => {
-      const user = gate(req, res);
+     async (req, res) => {
+      const user = (await gate(req, res));
       if (!user) return;
       const buf = req.body;
       if (!Buffer.isBuffer(buf) || !buf.length) return res.status(400).json({ error: "مفيش صوت" });
@@ -870,11 +887,11 @@ export function startServer() {
       try {
         const transcript = await transcribe(buf, `ask.${ext}`, user.id);
         if (!transcript) return res.status(422).json({ error: "مقدرتش أفهم الصوت، جرّب تاني" });
-        const contextText = buildAskContext(user.id, scope, date);
+        const contextText = (await buildAskContext(user.id, scope, date));
         const messages = [...listAskMessages(user.id, 20), { role: "user", content: transcript }];
         const reply = await chatAboutJournal({ messages, contextText, userId: user.id });
-        addAskMessage(user.id, "user", transcript);
-        addAskMessage(user.id, "assistant", reply);
+        (await addAskMessage(user.id, "user", transcript));
+        (await addAskMessage(user.id, "assistant", reply));
         res.json({ transcript, reply });
       } catch (err) {
         console.error("ask voice error:", err);
@@ -884,8 +901,8 @@ export function startServer() {
   );
 
   // تحويل رد لصوت (TTS) — للرد الصوتي في الشات
-  app.post("/api/tts", voiceLimiter, async (req, res) => {
-    const user = gate(req, res);
+  app.post("/api/tts", voiceLimiter,  async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
     const text = String(req.body?.text || "").trim();
     if (!text) return res.status(400).json({ error: "مفيش نص" });
@@ -905,8 +922,8 @@ export function startServer() {
     "/api/files",
     uploadLimiter,
     express.raw({ type: ["image/*", "application/pdf"], limit: "12mb" }),
-    async (req, res) => {
-      const user = gate(req, res);
+     async (req, res) => {
+      const user = (await gate(req, res));
       if (!user) return;
       const mime = String(req.headers["content-type"] || "").split(";")[0].trim().toLowerCase();
       if (!ALLOWED_UPLOAD.has(mime))
@@ -934,7 +951,7 @@ export function startServer() {
             console.error("classify error:", e);
           }
         }
-        const file = addFile({ userId: user.id, filename: safeName, mime, size: buf.length, category, description, path: fullPath });
+        const file = (await addFile({ userId: user.id, filename: safeName, mime, size: buf.length, category, description, path: fullPath }));
         res.json({ ok: true, file });
       } catch (err) {
         if (fullPath) { try { unlinkSync(fullPath); } catch {} } // منسيبش ملف يتيم من غير صف
@@ -943,15 +960,15 @@ export function startServer() {
       }
     }
   );
-  app.get("/api/files", (req, res) => {
-    const user = gate(req, res);
+  app.get("/api/files", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    res.json(listFiles(user.id));
+    res.json((await listFiles(user.id)));
   });
-  app.get("/api/files/:id/raw", (req, res) => {
-    const user = gate(req, res);
+  app.get("/api/files/:id/raw", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    const f = getFile(user.id, Number(req.params.id));
+    const f = (await getFile(user.id, Number(req.params.id)));
     if (!f || !f.path || !f.path.startsWith(uploadsDir)) return res.status(404).end();
     res.setHeader("Content-Type", f.mime || "application/octet-stream");
     res.setHeader("X-Content-Type-Options", "nosniff");
@@ -960,12 +977,12 @@ export function startServer() {
     res.setHeader("Cache-Control", "private, max-age=86400");
     res.sendFile(f.path);
   });
-  app.delete("/api/files/:id", (req, res) => {
-    const user = gate(req, res);
+  app.delete("/api/files/:id", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    const f = getFile(user.id, Number(req.params.id));
+    const f = (await getFile(user.id, Number(req.params.id)));
     if (f?.path) { try { unlinkSync(f.path); } catch {} }
-    res.json({ ok: deleteFile(user.id, Number(req.params.id)) });
+    res.json({ ok: (await deleteFile(user.id, Number(req.params.id))) });
   });
 
   /* ===== تعديل أي عنصر (مرونة التعديل) — PUT /api/<نوع>/:id ===== */
@@ -982,16 +999,16 @@ export function startServer() {
     metrics: updateMetricMeta,
   };
   for (const [kind, fn] of Object.entries(updaters)) {
-    app.put(`/api/${kind}/:id`, (req, res) => {
-      const user = gate(req, res);
+    app.put(`/api/${kind}/:id`, async (req, res) => {
+      const user = (await gate(req, res));
       if (!user) return;
-      res.json({ ok: fn(user.id, Number(req.params.id), req.body || {}) });
+      res.json({ ok: await fn(user.id, Number(req.params.id), req.body || {}) });
     });
   }
 
   // الكومبوزر في الداشبورد: "رتّبهالي" — بيشغّل الـ agent على النص
-  app.post("/api/log", async (req, res) => {
-    const user = gate(req, res);
+  app.post("/api/log",  async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
     const text = String(req.body?.text || "").trim();
     if (!text) return res.status(400).json({ error: "اكتب حاجة الأول" });
@@ -1011,8 +1028,8 @@ export function startServer() {
     "/api/voice",
     voiceLimiter,
     express.raw({ type: ["audio/*", "application/octet-stream"], limit: "25mb" }),
-    async (req, res) => {
-      const user = gate(req, res);
+     async (req, res) => {
+      const user = (await gate(req, res));
       if (!user) return;
       const buf = req.body;
       if (!buf || !buf.length) return res.status(400).json({ error: "مفيش صوت" });
@@ -1022,7 +1039,7 @@ export function startServer() {
         const transcript = await transcribe(buf, `voice.${ext}`, user.id);
         if (!transcript) return res.status(422).json({ error: "مقدرتش أفهم الصوت، جرّب تاني — تسجيلك محفوظ عندنا" });
         // منع تكرار: لو نفس التسجيل اتبعت واتعالج قبل كده بدقايق (ريتراي/دبل-سبمت) ماتعالجهوش تاني
-        const dup = recentIdenticalConversation(user.id, transcript, 15);
+        const dup = (await recentIdenticalConversation(user.id, transcript, 15));
         if (dup) {
           cleanupAudio(audioPath);
           return res.json({ transcript, reply: dup.ai_reply || "التسجيل ده اتسجّل قبل كده ✅", receipts: [], duplicate: true });
@@ -1039,29 +1056,29 @@ export function startServer() {
   );
 
   /* ===== خواطر / عصف ذهني ===== */
-  app.get("/api/thoughts", (req, res) => {
-    const user = gate(req, res);
+  app.get("/api/thoughts", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    res.json(listThoughts(user.id));
+    res.json((await listThoughts(user.id)));
   });
-  app.post("/api/thoughts", (req, res) => {
-    const user = gate(req, res);
+  app.post("/api/thoughts", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    const t = addThought(user.id, (req.body || {}).text, "text");
+    const t = (await addThought(user.id, (req.body || {}).text, "text"));
     if (!t) return res.status(400).json({ error: "اكتب خاطرة الأول" });
     res.json({ ok: true, thought: t });
   });
-  app.delete("/api/thoughts/:id", (req, res) => {
-    const user = gate(req, res);
+  app.delete("/api/thoughts/:id", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    res.json({ ok: deleteThought(user.id, Number(req.params.id)) });
+    res.json({ ok: (await deleteThought(user.id, Number(req.params.id))) });
   });
   app.post(
     "/api/thoughts/voice",
     voiceLimiter,
     express.raw({ type: ["audio/*", "application/octet-stream"], limit: "25mb" }),
-    async (req, res) => {
-      const user = gate(req, res);
+     async (req, res) => {
+      const user = (await gate(req, res));
       if (!user) return;
       const buf = req.body;
       if (!buf || !buf.length) return res.status(400).json({ error: "مفيش صوت" });
@@ -1071,7 +1088,7 @@ export function startServer() {
         const transcript = await transcribe(buf, `thought.${ext}`, user.id);
         if (!transcript) return res.status(422).json({ error: "مقدرتش أفهم الصوت، جرّب تاني — تسجيلك محفوظ عندنا" });
         cleanupAudio(audioPath); // نجح → الخام مبقاش محتاج
-        const thought = addThought(user.id, transcript, "voice");
+        const thought = (await addThought(user.id, transcript, "voice"));
         res.json({ transcript, thought });
       } catch (err) {
         console.error("thought voice error:", err, "| الصوت محفوظ في:", audioPath);
@@ -1082,12 +1099,12 @@ export function startServer() {
   );
 
   /* ===== التحليل والتقارير ===== */
-  app.get("/api/analyze", async (req, res) => {
-    const user = gate(req, res);
+  app.get("/api/analyze",  async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
     const days = Number(req.query.days) > 0 ? Number(req.query.days) : 7;
     const since = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
-    const entries = entriesSince(user.id, since);
+    const entries = (await entriesSince(user.id, since));
     if (!entries.length) return res.json({ analysis: "مفيش تدوينات في الفترة دي." });
     try {
       const analysis = await analyzeEntries(entries, user.id);
@@ -1099,12 +1116,12 @@ export function startServer() {
   });
 
   // التقرير الشامل الواحد — من كل كلام المستخدم في الفترة
-  app.get("/api/report", async (req, res) => {
-    const user = gate(req, res);
+  app.get("/api/report",  async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
     const days = Number(req.query.days) > 0 ? Number(req.query.days) : 30;
     try {
-      const data = buildReportData(user.id, days);
+      const data = (await buildReportData(user.id, days));
       const report = await unifiedReport(data, user.id);
       res.json({ report, data });
     } catch (err) {
@@ -1114,12 +1131,12 @@ export function startServer() {
   });
 
   // تقرير للدكتور: تلخيص AI + خط زمني للأعراض في فترة المتابعة
-  app.get("/api/conditions/:id/report", async (req, res) => {
-    const user = gate(req, res);
+  app.get("/api/conditions/:id/report",  async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    const condition = getCondition(user.id, Number(req.params.id));
+    const condition = (await getCondition(user.id, Number(req.params.id)));
     if (!condition) return res.status(404).json({ error: "المتابعة مش موجودة" });
-    const items = healthBetween(user.id, condition.start_date, condition.end_date);
+    const items = (await healthBetween(user.id, condition.start_date, condition.end_date));
     try {
       const summary = await doctorReport(condition, items, user.id);
       res.json({ condition, summary, timeline: items });
@@ -1144,65 +1161,65 @@ export function startServer() {
     metrics: deleteMetric,
   };
   for (const [kind, fn] of Object.entries(deleters)) {
-    app.delete(`/api/${kind}/:id`, (req, res) => {
-      const user = gate(req, res);
+    app.delete(`/api/${kind}/:id`, async (req, res) => {
+      const user = (await gate(req, res));
       if (!user) return;
       res.json({ ok: fn(user.id, Number(req.params.id)) });
     });
   }
 
   // إقفال متابعة (خلصت/مش محتاجها)
-  app.put("/api/conditions/:id/close", (req, res) => {
-    const user = gate(req, res);
+  app.put("/api/conditions/:id/close", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    res.json({ ok: closeCondition(user.id, Number(req.params.id)) });
+    res.json({ ok: (await closeCondition(user.id, Number(req.params.id))) });
   });
 
   /* ===== ماليات: إضافة يدوية من الداشبورد ===== */
-  app.get("/api/finance-categories", (req, res) => {
-    if (!gate(req, res)) return;
+  app.get("/api/finance-categories", async (req, res) => {
+    if (!(await gate(req, res))) return;
     res.json(FINANCE_CATEGORIES);
   });
 
   /* ===== ميزانية وهدف الشهر ===== */
-  app.get("/api/finance-budget", (req, res) => {
-    const user = gate(req, res);
+  app.get("/api/finance-budget", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    const month = /^\d{4}-\d{2}$/.test(String(req.query.month || "")) ? req.query.month : localToday().slice(0, 7);
-    res.json(getFinanceBudget(user.id, month));
+    const month = /^\d{4}-\d{2}$/.test(String(req.query.month || "")) ? req.query.month : (await localToday()).slice(0, 7);
+    res.json((await getFinanceBudget(user.id, month)));
   });
-  app.put("/api/finance-budget", (req, res) => {
-    const user = gate(req, res);
+  app.put("/api/finance-budget", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
     const { month, budget, goal } = req.body || {};
-    const m = /^\d{4}-\d{2}$/.test(String(month || "")) ? month : localToday().slice(0, 7);
-    res.json({ ok: true, budget: setFinanceBudget(user.id, m, { budget, goal }) });
+    const m = /^\d{4}-\d{2}$/.test(String(month || "")) ? month : (await localToday()).slice(0, 7);
+    res.json({ ok: true, budget: (await setFinanceBudget(user.id, m, { budget, goal })) });
   });
 
   /* ===== الأصول (دهب / كاش / أصول تانية) + أسعار حيّة ===== */
-  app.get("/api/assets", (req, res) => {
-    const user = gate(req, res);
+  app.get("/api/assets", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    res.json({ assets: listAssets(user.id), market: getAssetMarket() });
+    res.json({ assets: (await listAssets(user.id)), market: (await getAssetMarket()) });
   });
   // أسعار السوق لوحدها (للتحويل في صفحة الفلوس مثلاً)
-  app.get("/api/market", (req, res) => {
-    const user = gate(req, res);
+  app.get("/api/market", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    res.json(getAssetMarket());
+    res.json((await getAssetMarket()));
   });
-  app.post("/api/assets", (req, res) => {
-    const user = gate(req, res);
+  app.post("/api/assets", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
     const b = req.body || {};
     if (!b.type) return res.status(400).json({ error: "اختار نوع الأصل" });
-    res.json({ ok: true, asset: addAsset({ userId: user.id, ...b }) });
+    res.json({ ok: true, asset: (await addAsset({ userId: user.id, ...b })) });
   });
   // مسارات محددة قبل /:id عشان متتلخبطش مع :id
-  app.post("/api/assets/refresh-prices", async (req, res) => {
-    const user = gate(req, res);
+  app.post("/api/assets/refresh-prices",  async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    const prev = getAssetMarket();
+    const prev = (await getAssetMarket());
     let rates = {};
     let goldG24Egp = null;
     try {
@@ -1222,39 +1239,39 @@ export function startServer() {
       const usdEgp = rates.USD || prev.rates?.USD;
       if (usdPerOz && usdEgp) goldG24Egp = (usdPerOz / 31.1035) * usdEgp; // جرام عيار ٢٤ بالجنيه
     } catch (e) { console.error("gold fetch failed:", e?.message); }
-    const market = setAssetMarket({
+    const market = (await setAssetMarket({
       goldG24Egp: goldG24Egp ?? prev.goldG24Egp,
       rates: Object.keys(rates).length ? { ...prev.rates, ...rates } : prev.rates,
-    });
+    }));
     res.json(market);
   });
-  app.put("/api/assets/market", (req, res) => {
-    const user = gate(req, res);
+  app.put("/api/assets/market", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    const prev = getAssetMarket();
+    const prev = (await getAssetMarket());
     const { goldG24Egp, rates } = req.body || {};
-    res.json(setAssetMarket({
+    res.json((await setAssetMarket({
       goldG24Egp: goldG24Egp != null && goldG24Egp !== "" ? Number(goldG24Egp) : prev.goldG24Egp,
       rates: { ...prev.rates, ...(rates || {}) },
-    }));
+    })));
   });
-  app.put("/api/assets/:id", (req, res) => {
-    const user = gate(req, res);
+  app.put("/api/assets/:id", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    res.json({ ok: updateAsset(user.id, Number(req.params.id), req.body || {}) });
+    res.json({ ok: (await updateAsset(user.id, Number(req.params.id), req.body || {})) });
   });
-  app.delete("/api/assets/:id", (req, res) => {
-    const user = gate(req, res);
+  app.delete("/api/assets/:id", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    res.json({ ok: deleteAsset(user.id, Number(req.params.id)) });
+    res.json({ ok: (await deleteAsset(user.id, Number(req.params.id))) });
   });
-  app.post("/api/finance", (req, res) => {
-    const user = gate(req, res);
+  app.post("/api/finance", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
     const { entryDate, direction, amount, currency, category, note } = req.body || {};
     if (amount == null || amount === "" || isNaN(Number(amount)))
       return res.status(400).json({ error: "المبلغ مطلوب" });
-    const id = addFinance({
+    const id = (await addFinance({
       userId: user.id,
       entryDate: entryDate || localToday(),
       direction,
@@ -1262,49 +1279,49 @@ export function startServer() {
       currency,
       category,
       note,
-    });
+    }));
     res.json({ ok: true, id });
   });
 
   /* ===== صحة: إضافة يدوية ===== */
-  app.post("/api/health", (req, res) => {
-    const user = gate(req, res);
+  app.post("/api/health", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
     const { entryDate, category, detail, bodyRegion } = req.body || {};
     if (!detail) return res.status(400).json({ error: "الوصف مطلوب" });
-    const id = addHealth({ userId: user.id, entryDate, category, detail, bodyRegion });
+    const id = (await addHealth({ userId: user.id, entryDate, category, detail, bodyRegion }));
     res.json({ ok: true, id });
   });
 
   /* ===== عادات: إنشاء/تسجيل/إلغاء تسجيل من الداشبورد ===== */
-  app.post("/api/habits", (req, res) => {
-    const user = gate(req, res);
+  app.post("/api/habits", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
     const { title, kind, emoji, note } = req.body || {};
     if (!title) return res.status(400).json({ error: "اسم العادة مطلوب" });
-    const habit = addHabit({ userId: user.id, title, kind, emoji, note });
+    const habit = (await addHabit({ userId: user.id, title, kind, emoji, note }));
     res.json({ ok: true, habit });
   });
-  app.post("/api/habits/:id/log", (req, res) => {
-    const user = gate(req, res);
+  app.post("/api/habits/:id/log", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
     const { date } = req.body || {};
     res.json({ ok: true, ...logHabit(Number(req.params.id), date) });
   });
-  app.delete("/api/habits/:id/log", (req, res) => {
-    const user = gate(req, res);
+  app.delete("/api/habits/:id/log", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    const date = req.query.date || localToday();
-    res.json({ ok: unlogHabit(Number(req.params.id), date) });
+    const date = req.query.date || (await localToday());
+    res.json({ ok: (await unlogHabit(Number(req.params.id), date)) });
   });
 
   /* ===== أهداف: إنشاء/تعديل يدوي من الداشبورد ===== */
-  app.post("/api/goals", (req, res) => {
-    const user = gate(req, res);
+  app.post("/api/goals", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
     const { title, target, unit, note, period, deadline } = req.body || {};
     if (!title) return res.status(400).json({ error: "العنوان مطلوب" });
-    const g = applyGoal({
+    const g = (await applyGoal({
       userId: user.id,
       title,
       target: target != null && target !== "" ? Number(target) : null,
@@ -1312,77 +1329,77 @@ export function startServer() {
       note: note || null,
       period: period || null,
       deadline: deadline || null,
-    });
+    }));
     res.json({ ok: true, goal: g });
   });
-  app.put("/api/goals/:id/current", (req, res) => {
-    const user = gate(req, res);
+  app.put("/api/goals/:id/current", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
     const { current } = req.body || {};
-    res.json({ ok: setGoalCurrent(user.id, Number(req.params.id), Number(current) || 0) });
+    res.json({ ok: (await setGoalCurrent(user.id, Number(req.params.id), Number(current) || 0)) });
   });
 
   // سجل تقدّم الهدف (إمتى زوّدت كام)
-  app.get("/api/goals/:id/log", (req, res) => {
-    const user = gate(req, res);
+  app.get("/api/goals/:id/log", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    res.json(goalLog(user.id, Number(req.params.id)));
+    res.json((await goalLog(user.id, Number(req.params.id))));
   });
   // حذف بند من سجل الهدف (بيطرح الدلتا من رصيد الهدف)
-  app.delete("/api/goals/log/:logId", (req, res) => {
-    const user = gate(req, res);
+  app.delete("/api/goals/log/:logId", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    res.json({ ok: deleteGoalLog(user.id, Number(req.params.logId)) });
+    res.json({ ok: (await deleteGoalLog(user.id, Number(req.params.logId))) });
   });
   // تعديل بند في سجل الهدف (التفاصيل و/أو المبلغ)
-  app.put("/api/goals/log/:logId", (req, res) => {
-    const user = gate(req, res);
+  app.put("/api/goals/log/:logId", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
     const { delta, note } = req.body || {};
-    res.json({ ok: updateGoalLog(user.id, Number(req.params.logId), { delta, note }) });
+    res.json({ ok: (await updateGoalLog(user.id, Number(req.params.logId), { delta, note })) });
   });
 
   /* ===== المتتبِّعات اليومية (أرقام يومية) ===== */
-  app.get("/api/metrics", (req, res) => {
-    const user = gate(req, res);
+  app.get("/api/metrics", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    res.json(listMetricsWithStats(user.id));
+    res.json((await listMetricsWithStats(user.id)));
   });
-  app.post("/api/metrics", (req, res) => {
-    const user = gate(req, res);
+  app.post("/api/metrics", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
     const { title, value, unit, emoji, daily_target, date, note } = req.body || {};
     if (!title) return res.status(400).json({ error: "العنوان مطلوب" });
     // لو مفيش قيمة → ننشئ المتتبِّع بس (من غير ما نسجّل صفر وهمي لليوم)
     const hasValue = value !== "" && value != null;
     const m = hasValue
-      ? logMetric({ userId: user.id, title, value, unit, emoji, dailyTarget: daily_target, date, note })
-      : upsertMetric({ userId: user.id, title, unit, emoji, dailyTarget: daily_target });
+      ? (await logMetric({ userId: user.id, title, value, unit, emoji, dailyTarget: daily_target, date, note }))
+      : (await upsertMetric({ userId: user.id, title, unit, emoji, dailyTarget: daily_target }));
     res.json({ ok: !!m, metric: m });
   });
   // تسجيل/تعديل قيمة يوم معيّن (من الواجهة) — قيمة فاضية = امسح تسجيل اليوم
-  app.post("/api/metrics/:id/day", (req, res) => {
-    const user = gate(req, res);
+  app.post("/api/metrics/:id/day", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
     const { date, value, note } = req.body || {};
-    res.json({ ok: setMetricDay(user.id, Number(req.params.id), date || null, value, note || null) });
+    res.json({ ok: (await setMetricDay(user.id, Number(req.params.id), date || null, value, note || null)) });
   });
-  app.get("/api/metrics/:id/history", (req, res) => {
-    const user = gate(req, res);
+  app.get("/api/metrics/:id/history", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    res.json(metricHistory(user.id, Number(req.params.id)));
+    res.json((await metricHistory(user.id, Number(req.params.id))));
   });
-  app.delete("/api/metrics/log/:logId", (req, res) => {
-    const user = gate(req, res);
+  app.delete("/api/metrics/log/:logId", async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
-    res.json({ ok: deleteMetricLog(user.id, Number(req.params.logId)) });
+    res.json({ ok: (await deleteMetricLog(user.id, Number(req.params.logId))) });
   });
 
   /* ===== بلّغ عن مشكلة → نظام البلاغات في سينتاكس أكاديمي =====
      الإرسال من السيرفر (مش من المتصفح) عشان المفتاح السري مايتعرّضش،
      والموضوع بيتحط «دوّنلي» + نسخة التطبيق تلقائيًا عشان نعرف نصلّح بسرعة. */
-  app.post("/api/report", reportLimiter, async (req, res) => {
-    const user = gate(req, res);
+  app.post("/api/report", reportLimiter,  async (req, res) => {
+    const user = (await gate(req, res));
     if (!user) return;
     const message = String(req.body?.message || "").trim();
     if (message.length < 10) return res.status(400).json({ error: "اكتب المشكلة بتفصيل شوية (١٠ حروف على الأقل)" });
@@ -1430,6 +1447,13 @@ export function startServer() {
     res.status(status).json({ error: status === 413 ? "الملف كبير جدًا (الحد ١٢ ميجا)" : "حصل خطأ في الخادم" });
   });
 
+  return app;
+}
+
+// التشغيل المحلي بس. على Vercel بنصدّر الـ app مباشرة من api/index.js
+// من غير listen (مفيش process طويل هناك).
+export async function startServer() {
+  const app = await createApp();
   app.listen(config.port, () =>
     console.log(`📊 الداشبورد شغّال على http://localhost:${config.port}`)
   );

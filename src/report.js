@@ -12,13 +12,13 @@ import {
   activeConditions,
 } from "./db.js";
 
-export function buildReportData(userId, days = 30) {
-  const to = localToday();
+export async function buildReportData(userId, days = 30) {
+  const to = (await localToday());
   const d = new Date(`${to}T00:00:00Z`);
   d.setUTCDate(d.getUTCDate() - (Number(days) - 1));
   const from = d.toISOString().slice(0, 10);
 
-  const finance = financeSince(userId, from);
+  const finance = (await financeSince(userId, from));
   const income = finance.filter((f) => f.direction === "income").reduce((a, f) => a + f.amount, 0);
   const expense = finance.filter((f) => f.direction === "expense").reduce((a, f) => a + f.amount, 0);
   const byCategory = {};
@@ -27,13 +27,13 @@ export function buildReportData(userId, days = 30) {
     byCategory[c] = (byCategory[c] || 0) + f.amount;
   }
 
-  const health = healthSince(userId, from);
-  const tasks = listTasks(userId, from, to);
+  const health = (await healthSince(userId, from));
+  const tasks = (await listTasks(userId, from, to));
 
   return {
     from,
     to,
-    journal: entriesSince(userId, from).map((e) => ({
+    journal: (await entriesSince(userId, from)).map((e) => ({
       date: e.entry_date,
       mood: e.mood,
       text: (e.transcript || e.summary || "").slice(0, 600),
@@ -44,7 +44,7 @@ export function buildReportData(userId, days = 30) {
     mental: health
       .filter((h) => h.category === "نفسية")
       .map((h) => ({ date: h.entry_date, detail: h.detail })),
-    conditions: activeConditions(userId).map((c) => ({ title: c.title, since: c.start_date })),
+    conditions: (await activeConditions(userId)).map((c) => ({ title: c.title, since: c.start_date })),
     finance: {
       income,
       expense,
@@ -52,14 +52,14 @@ export function buildReportData(userId, days = 30) {
       expense_by_category: byCategory,
       count: finance.length,
     },
-    goals: listGoals(userId).map((g) => ({
+    goals: (await listGoals(userId)).map((g) => ({
       title: g.title,
       current: g.current,
       target: g.target,
       unit: g.unit,
       percent: g.target ? Math.round((g.current / g.target) * 100) : null,
     })),
-    habits: listHabits(userId).map((h) => ({
+    habits: (await listHabits(userId)).map((h) => ({
       title: h.title,
       kind: h.kind,
       streak: h.streak,

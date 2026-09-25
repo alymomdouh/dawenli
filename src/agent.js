@@ -5,7 +5,7 @@
    - عنده أدوات استعلام فيجاوب على "صرفت كام الشهر ده؟" من البيانات الحقيقية.
    - بيبادر يوميًا ويسأل عن اللي ناقص (مصاريف؟ عادات؟ يومك عدى إزاي؟). */
 
-import { client, logChatUsage, chatModel } from "./openai.js";
+import { chatClient, logChatUsage, chatModel } from "./openai.js";
 import { config } from "./config.js";
 import {
   localToday,
@@ -396,14 +396,14 @@ const isTime = (s) => typeof s === "string" && /^\d{2}:\d{2}$/.test(s);
 
 // بينفّذ أداة واحدة ويرجّع { result للموديل, receipt سطر للمستخدم }
 // ctx: { userId, sourceText } — النص الأصلي بيتحفظ في اليوميات مش ملخص الموديل بس
-function executeTool(ctx, name, args) {
+async function executeTool(ctx, name, args) {
   const { userId } = ctx;
-  const today = localToday();
+  const today = (await localToday());
   const date = isDate(args.date) ? args.date : today;
 
   switch (name) {
     case "save_journal": {
-      const r = upsertJournalForDay({
+      const r = (await upsertJournalForDay({
         userId,
         entryDate: date,
         mood: args.mood || null,
@@ -411,7 +411,7 @@ function executeTool(ctx, name, args) {
         tags: Array.isArray(args.tags) ? args.tags : [],
         transcript: ctx.sourceText || args.summary,
         raw: { via: "agent" },
-      });
+      }));
       return {
         result: { ok: true, merged: r.merged },
         receipt: `📝 يوميات (${date})${args.mood ? " — " + args.mood : ""}`,
@@ -419,7 +419,7 @@ function executeTool(ctx, name, args) {
     }
     case "correct_journal": {
       if (!isDate(args.date)) return { result: { ok: false, error: "date لازم YYYY-MM-DD" } };
-      const r = correctJournal(userId, args.date, String(args.find || ""), String(args.replace ?? ""));
+      const r = (await correctJournal(userId, args.date, String(args.find || ""), String(args.replace ?? "")));
       return {
         result: { ok: r.changed, ...r },
         receipt: r.changed
@@ -436,7 +436,7 @@ function executeTool(ctx, name, args) {
       const finKey = `${date}|${finDir}|${amount}|${normNote(args.note)}`;
       if (ctx.seenFinance?.has(finKey)) return { result: { ok: true, duplicate: true } };
       ctx.seenFinance?.add(finKey);
-      addFinance({
+      (await addFinance({
         userId,
         entryDate: date,
         direction: args.direction,
@@ -444,7 +444,7 @@ function executeTool(ctx, name, args) {
         currency: args.currency || null,
         category: args.category || "أخرى",
         note: args.note || null,
-      });
+      }));
       const sign = args.direction === "income" ? "➕ دخل" : "➖ صرف";
       return {
         result: { ok: true },
@@ -454,28 +454,28 @@ function executeTool(ctx, name, args) {
     case "delete_finance": {
       const id = Number(args.id);
       if (!(id > 0)) return { result: { ok: false, error: "محتاج id صحيح" } };
-      const ok = deleteFinance(userId, id);
+      const ok = (await deleteFinance(userId, id));
       return { result: { ok }, receipt: ok ? `🗑️ اتمسح قيد مالي غلط (#${id})` : `⚠️ ملقيتش القيد #${id}` };
     }
     case "log_idea": {
       if (!args.title) return { result: { ok: false, error: "محتاج عنوان للفكرة" } };
-      const idea = addIdea({ userId, title: args.title, detail: args.detail || null });
+      const idea = (await addIdea({ userId, title: args.title, detail: args.detail || null }));
       return { result: { ok: !!idea }, receipt: `💡 فكرة: ${args.title}` };
     }
     case "log_problem": {
       if (!args.title) return { result: { ok: false, error: "محتاج عنوان للمشكلة" } };
-      const p = addProblem({ userId, title: args.title, detail: args.detail || null, area: args.area });
+      const p = (await addProblem({ userId, title: args.title, detail: args.detail || null, area: args.area }));
       return {
         result: { ok: !!p, created: p?.created },
         receipt: `🧩 مشكلة: ${args.title}${args.area ? " · " + args.area : ""}`,
       };
     }
     case "resolve_problem": {
-      const r = resolveProblem(userId, { title: args.title });
+      const r = (await resolveProblem(userId, { title: args.title }));
       return { result: { ok: !!r }, receipt: r ? `🧩 اتحلّت: ${r.title}` : `⚠️ ملقيتش المشكلة دي` };
     }
     case "upsert_goal": {
-      const applied = applyGoal({
+      const applied = (await applyGoal({
         userId,
         title: args.title,
         target: args.target ?? null,
@@ -485,7 +485,7 @@ function executeTool(ctx, name, args) {
         note: args.note || null,
         period: args.period !== undefined ? args.period : undefined,
         deadline: args.deadline !== undefined ? args.deadline : undefined,
-      });
+      }));
       if (!applied) return { result: { ok: false, error: "title مطلوب" } };
       const pct = applied.target
         ? Math.min(100, Math.round((applied.current / applied.target) * 100))
@@ -499,7 +499,7 @@ function executeTool(ctx, name, args) {
       };
     }
     case "log_metric": {
-      const m = logMetric({
+      const m = (await logMetric({
         userId,
         title: args.title,
         value: args.value,
@@ -508,7 +508,7 @@ function executeTool(ctx, name, args) {
         unit: args.unit || null,
         emoji: args.emoji || null,
         dailyTarget: args.daily_target ?? undefined,
-      });
+      }));
       if (!m) return { result: { ok: false, error: "محتاج title و value" } };
       const unit = m.unit ? " " + m.unit : "";
       return {
@@ -518,15 +518,15 @@ function executeTool(ctx, name, args) {
     }
     case "log_habit": {
       const receipts = [];
-      let habit = findHabitByTitle(userId, args.title);
+      let habit = (await findHabitByTitle(userId, args.title));
       if (!habit) {
-        habit = addHabit({ userId, title: args.title, kind: args.kind || "do", emoji: args.emoji || null });
+        habit = (await addHabit({ userId, title: args.title, kind: args.kind || "do", emoji: args.emoji || null }));
         if (habit?.created)
           receipts.push(`${args.emoji || (args.kind === "quit" ? "🚭" : "🔁")} عادة جديدة: ${habit.title}`);
       }
       let logged = false;
       if (habit && (args.action === "done" || args.action === "both")) {
-        const r = logHabit(habit.id, date);
+        const r = (await logHabit(habit.id, date));
         logged = r.logged;
         if (r.logged) receipts.push(`✅ عادة اتعملت: ${habit.title} (${r.date})`);
       }
@@ -534,32 +534,32 @@ function executeTool(ctx, name, args) {
     }
     case "add_task": {
       if (!isDate(args.date)) return { result: { ok: false, error: "date لازم YYYY-MM-DD" } };
-      const task = addTask({
+      const task = (await addTask({
         userId,
         title: args.title,
         dueDate: args.date,
         dueTime: isTime(args.time) ? args.time : null,
         note: args.note || null,
-      });
+      }));
       return {
         result: { ok: true, id: task.id },
         receipt: `📅 مهمة في التقويم: ${task.title} — ${task.due_date}${task.due_time ? " ⏰ " + task.due_time : ""}`,
       };
     }
     case "complete_task": {
-      const task = completeTask(userId, { id: args.id, title: args.title });
+      const task = (await completeTask(userId, { id: args.id, title: args.title }));
       if (!task) return { result: { ok: false, error: "ملقتش المهمة" } };
       return { result: { ok: true, title: task.title }, receipt: `☑️ مهمة خلصت: ${task.title}` };
     }
     case "log_health": {
-      addHealth({
+      (await addHealth({
         userId,
         entryDate: date,
         atTime: isTime(args.time) ? args.time : null,
         category: HEALTH_CATS.includes(args.category) ? args.category : "ملاحظة",
         detail: args.detail,
         bodyRegion: REGIONS.includes(args.body_region) ? args.body_region : "عام",
-      });
+      }));
       const ico = args.category === "نفسية" ? "🧠" : "🩺";
       return {
         result: { ok: true },
@@ -567,12 +567,12 @@ function executeTool(ctx, name, args) {
       };
     }
     case "track_condition": {
-      const c = addCondition({
+      const c = (await addCondition({
         userId,
         title: args.title,
         startDate: today,
         durationDays: args.duration_days || 30,
-      });
+      }));
       if (!c) return { result: { ok: false, error: "title مطلوب" } };
       return {
         result: { ok: true, created: c.created, end_date: c.end_date },
@@ -582,22 +582,22 @@ function executeTool(ctx, name, args) {
       };
     }
     case "log_meal": {
-      addMeal({
+      (await addMeal({
         userId,
         entryDate: date,
         atTime: isTime(args.time) ? args.time : null,
         items: args.items,
         note: args.note || null,
-      });
+      }));
       return { result: { ok: true }, receipt: `🍽️ أكل (${date}): ${args.items}` };
     }
     case "remember": {
-      const f = upsertProfileFact({
+      const f = (await upsertProfileFact({
         userId,
         category: args.category,
         key: args.key,
         value: args.value,
-      });
+      }));
       if (!f) return { result: { ok: false, error: "key و value مطلوبين" } };
       return {
         result: { ok: true, created: f.created },
@@ -618,10 +618,10 @@ function executeTool(ctx, name, args) {
       switch (args.topic) {
         case "day": {
           // كل اللي حصل في يوم (أو فترة) — للأسئلة زي "امبارح عملت إيه"
-          const journal = entriesBetween(userId, from, to);
-          const meals = mealsBetween(userId, from, to);
-          const health = healthBetween(userId, from, to);
-          const fin = financeBetween(userId, from, to);
+          const journal = (await entriesBetween(userId, from, to));
+          const meals = (await mealsBetween(userId, from, to));
+          const health = (await healthBetween(userId, from, to));
+          const fin = (await financeBetween(userId, from, to));
           return {
             result: {
               from, to,
@@ -634,7 +634,7 @@ function executeTool(ctx, name, args) {
           };
         }
         case "finance": {
-          const rows = financeBetween(userId, from, to);
+          const rows = (await financeBetween(userId, from, to));
           const income = rows.filter((r) => r.direction === "income").reduce((a, r) => a + r.amount, 0);
           const expense = rows.filter((r) => r.direction === "expense").reduce((a, r) => a + r.amount, 0);
           const byCat = {};
@@ -650,38 +650,38 @@ function executeTool(ctx, name, args) {
         }
         case "meals":
           return {
-            result: mealsBetween(userId, from, to).map((m) => ({
+            result: (await mealsBetween(userId, from, to)).map((m) => ({
               date: m.entry_date, items: m.items, time: m.at_time, note: m.note,
             })),
           };
         case "goals":
           return {
-            result: listGoals(userId).map((g) => ({
+            result: (await listGoals(userId)).map((g) => ({
               title: g.title, current: g.current, target: g.target, unit: g.unit,
               percent: g.target ? Math.round((g.current / g.target) * 100) : null,
             })),
           };
         case "habits":
           return {
-            result: listHabits(userId).map((h) => ({
+            result: (await listHabits(userId)).map((h) => ({
               title: h.title, kind: h.kind, streak: h.streak, total: h.total, done_today: h.doneToday,
             })),
           };
         case "tasks":
           return {
-            result: listTasks(userId, daysAgo(7), daysAhead(days)).map((t) => ({
+            result: (await listTasks(userId, daysAgo(7), daysAhead(days))).map((t) => ({
               id: t.id, title: t.title, date: t.due_date, time: t.due_time, status: t.status,
             })),
           };
         case "health":
           return {
-            result: healthBetween(userId, from, to).map((h) => ({
+            result: (await healthBetween(userId, from, to)).map((h) => ({
               date: h.entry_date, category: h.category, detail: h.detail, region: h.body_region,
             })),
           };
         case "journal":
           return {
-            result: entriesBetween(userId, from, to).map((e) => ({
+            result: (await entriesBetween(userId, from, to)).map((e) => ({
               date: e.entry_date, mood: e.mood, summary: e.summary,
             })),
           };
@@ -702,22 +702,22 @@ function weekdayOf(dateStr) {
 }
 
 // لقطة سريعة من بيانات المستخدم — بتتبني مع كل رسالة عشان الـ agent يكون فاهم وضعه
-function buildSnapshot(userId) {
-  const today = localToday();
+async function buildSnapshot(userId) {
+  const today = (await localToday());
   // آخر ٣ أيام — عشان الـ agent يشوف قيود امبارح كمان ومايعيدش تسجيل نفس اليوم بتاريخ تاني
   const since3 = new Date(new Date(today + "T00:00:00Z").getTime() - 2 * 86400000).toISOString().slice(0, 10);
-  const recentFinance = financeSince(userId, since3);
+  const recentFinance = (await financeSince(userId, since3));
   const todayFinance = recentFinance.filter((f) => f.entry_date === today);
   const spentToday = todayFinance.filter((f) => f.direction === "expense").reduce((a, f) => a + f.amount, 0);
-  const goals = listGoals(userId).slice(0, 10);
-  const metrics = listMetricsWithStats(userId);
-  const habits = listHabits(userId);
-  const tasks = pendingTasks(userId, 12).filter((t) => t.due_date <= daysAhead(7));
-  const conditions = activeConditions(userId);
-  const ideas = recentIdeas(userId, 12);
-  const problems = activeProblems(userId);
-  const recentJournal = listEntries(userId, 3);
-  const profile = profileForAgent(userId); // الذاكرة الدائمة عن الشخص
+  const goals = (await listGoals(userId)).slice(0, 10);
+  const metrics = (await listMetricsWithStats(userId));
+  const habits = (await listHabits(userId));
+  const tasks = (await pendingTasks(userId, 12)).filter((t) => t.due_date <= daysAhead(7));
+  const conditions = (await activeConditions(userId));
+  const ideas = (await recentIdeas(userId, 12));
+  const problems = (await activeProblems(userId));
+  const recentJournal = (await listEntries(userId, 3));
+  const profile = (await profileForAgent(userId)); // الذاكرة الدائمة عن الشخص
 
   // الأسبوع الجاي بالتواريخ عشان "الخميس الجاي" تتحول صح
   const week = [];
@@ -747,12 +747,12 @@ function buildSnapshot(userId) {
     finance_recent: recentFinance.map(
       (f) => `${f.entry_date} #${f.id} ${f.direction === "income" ? "دخل" : "صرف"} ${f.amount} ${f.currency || "جنيه"}${f.note ? " · " + f.note : ""}`
     ),
-    goals: goals.map((g) => {
+    goals: await Promise.all(goals.map(async (g) => {
       const base = `${g.title}: ${g.current}${g.unit ? " " + g.unit : ""}${g.target ? ` من ${g.target}` : ""}`;
-      if (goalExpired(g, today)) return `${base} — ⌛ خلص وقته (${g.deadline}) فبطّلنا متابعته، ماتزوّدهوش إلا لو المستخدم طلب صراحةً`;
+      if ((await goalExpired(g, today))) return `${base} — ⌛ خلص وقته (${g.deadline}) فبطّلنا متابعته، ماتزوّدهوش إلا لو المستخدم طلب صراحةً`;
       if (g.deadline) return `${base} — لحد ${g.deadline}`;
       return base;
-    }),
+    })),
     metrics: metrics.map((m) => `${m.title}${m.unit ? ` (${m.unit})` : ""}: النهاردة ${m.stats.today ?? "لسه"}${m.daily_target ? ` / هدف يومي ${m.daily_target}` : ""} — المتوسط ${m.stats.week_avg}`),
     habits: habits.map((h) => `${h.title} (${h.kind === "quit" ? "بيبطّلها" : "بيعملها"})${h.doneToday ? " ✓ اتعملت النهاردة" : ""} — ستريك ${h.streak}`),
     pending_tasks: tasks.map((t) => `#${t.id} ${t.title} — ${t.due_date}${t.due_time ? " " + t.due_time : ""}`),
@@ -825,10 +825,10 @@ const HISTORY_LIMIT = 8;
 
 export async function runAgent({ user, text, kind = "text" }) {
   const userId = user.id;
-  touchUser(userId); // حدّث آخر ظهور مع كل نشاط فعلي
+  (await touchUser(userId)); // حدّث آخر ظهور مع كل نشاط فعلي
   const seenFinance = new Set(); // حاجز تكرار للفلوس داخل نفس الرسالة
-  const snapshot = buildSnapshot(userId);
-  const history = recentConversations(userId, HISTORY_LIMIT);
+  const snapshot = (await buildSnapshot(userId));
+  const history = (await recentConversations(userId, HISTORY_LIMIT));
 
   const messages = [
     { role: "system", content: SYSTEM_PROMPT },
@@ -847,9 +847,9 @@ export async function runAgent({ user, text, kind = "text" }) {
   const toolLog = [];
   let reply = "";
 
-  const model = chatModel(); // موديل المزود المتظبط في الإعدادات (openai/gemini/grok...)
+  const model = await chatModel(); // موديل المزود المتظبط في الإعدادات (openai/gemini/grok...)
   for (let turn = 0; turn < MAX_TURNS; turn++) {
-    const res = await client.chat.completions.create({
+    const res = await (await chatClient()).chat.completions.create({
       model,
       messages,
       tools: TOOLS,
@@ -857,7 +857,7 @@ export async function runAgent({ user, text, kind = "text" }) {
       // من غيرها الموديلات الصغيرة بترد كلام وخلاص ومفيش حاجة بتتسجل
       tool_choice: turn === 0 ? "required" : "auto",
     });
-    logChatUsage("agent", model, res, userId);
+    await logChatUsage("agent", model, res, userId);
     const msg = res.choices[0].message;
     messages.push(msg);
     console.log(
@@ -877,7 +877,7 @@ export async function runAgent({ user, text, kind = "text" }) {
       } catch {}
       let out;
       try {
-        out = executeTool({ userId, sourceText: text, seenFinance }, tc.function.name, args);
+        out = (await executeTool({ userId, sourceText: text, seenFinance }, tc.function.name, args));
       } catch (err) {
         // اللوج ده بيطلع في pm2 logs — أهم حاجة للتشخيص على السيرفر
         console.error(`❌ tool ${tc.function.name} failed with args ${JSON.stringify(args)}:`, err);
@@ -900,7 +900,7 @@ export async function runAgent({ user, text, kind = "text" }) {
   const savedJournal = toolLog.some((t) => t.tool === "save_journal");
   if (kind === "voice" && !savedJournal && text && text.trim().length >= 150) {
     try {
-      upsertJournalForDay({
+      (await upsertJournalForDay({
         userId,
         entryDate: localToday(),
         mood: null,
@@ -908,19 +908,19 @@ export async function runAgent({ user, text, kind = "text" }) {
         tags: [],
         transcript: text.trim(),
         raw: { via: "voice-autosave" },
-      });
+      }));
       receipts.push("📝 سجّلتلك التسجيل في يومياتك");
     } catch (e) { console.error("voice journal autosave failed:", e); }
   }
 
-  logConversation({
+  (await logConversation({
     userId,
     chatId: user.chat_id,
     kind,
     userText: text,
     aiReply: reply,
     meta: toolLog.length ? { tools: toolLog } : null,
-  });
+  }));
 
   return { reply, receipts };
 }
@@ -930,24 +930,24 @@ export async function runAgent({ user, text, kind = "text" }) {
 
 export async function composeCheckin(user) {
   const userId = user.id;
-  const today = localToday();
+  const today = (await localToday());
 
   const missing = [];
-  const todayEntries = listEntries(userId, 8).filter((e) => e.entry_date === today);
+  const todayEntries = (await listEntries(userId, 8)).filter((e) => e.entry_date === today);
   if (!todayEntries.length) missing.push("لسه ماحكاش عن يومه النهاردة (يومياته فاضية)");
   else if (!todayEntries.some((e) => e.mood)) missing.push("حكى عن يومه بس مذكرش مزاجه/إحساسه النهاردة");
-  const financeToday = financeSince(userId, today);
+  const financeToday = (await financeSince(userId, today));
   if (!financeToday.length) missing.push("ماسجّلش أي مصاريف النهاردة (اسأله صرف كام؟)");
-  const habits = listHabits(userId);
+  const habits = (await listHabits(userId));
   const notDone = habits.filter((h) => !h.doneToday).map((h) => h.title);
   if (notDone.length) missing.push(`عادات لسه ماتعلّمتش النهاردة: ${notDone.join("، ")}`);
-  const healthToday = healthSince(userId, today);
+  const healthToday = (await healthSince(userId, today));
   if (!healthToday.length) missing.push("مفيش أي تسجيل صحي أو نفسي النهاردة");
-  const tomorrowTasks = listTasks(userId, daysAhead(1), daysAhead(1)).filter((t) => t.status === "pending");
+  const tomorrowTasks = (await listTasks(userId, daysAhead(1), daysAhead(1))).filter((t) => t.status === "pending");
   if (tomorrowTasks.length)
     missing.push(`مهام بكرة: ${tomorrowTasks.map((t) => t.title + (t.due_time ? " " + t.due_time : "")).join("، ")}`);
 
-  const goals = listGoals(userId).slice(0, 5);
+  const goals = (await listGoals(userId)).slice(0, 5);
 
   const prompt = `انت "دوّنلي". دلوقتي معاد الـ check-in اليومي بتاعك مع المستخدم${user.name ? " (" + user.name + ")" : ""}.
 اكتب رسالة قصيرة (سطرين لتلاتة) بعربي بسيط محايد (مش لهجة بلد معيّن) تسأله عن يومه وتركّز على ١-٢ من الحاجات الناقصة دي بالتحديد:
@@ -956,15 +956,15 @@ ${goals.length ? "\nأهدافه الحالية (لو حبيت تفكّره بو
 
 خليها دافية وشخصية ومش رسمية، وبسؤال واحد واضح يسهل يرد عليه. من غير مقدمات — الرسالة نفسها بس.`;
 
-  const checkinModel = chatModel();
-  const res = await client.chat.completions.create({
+  const checkinModel = await chatModel();
+  const res = await (await chatClient()).chat.completions.create({
     model: checkinModel,
     messages: [{ role: "user", content: prompt }],
   });
-  logChatUsage("agent", checkinModel, res, userId);
+  await logChatUsage("agent", checkinModel, res, userId);
   const message = res.choices[0].message.content.trim();
 
   // بنسجّلها في المحادثة عشان لما يرد، الـ agent يبقى فاكر هو سأل إيه
-  logConversation({ userId, chatId: user.chat_id, kind: "checkin", userText: null, aiReply: message });
+  (await logConversation({ userId, chatId: user.chat_id, kind: "checkin", userText: null, aiReply: message }));
   return message;
 }

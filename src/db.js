@@ -1,19 +1,11 @@
-import Database from "better-sqlite3";
-import { mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+// كل الوصول للداتابيز عن طريق libSQL (Turso) — شوف src/sqlite.js للـ adapter.
+// ملاحظة: الدوال هنا كلها بقت async (كانت sync على better-sqlite3).
+// إعدادات WAL و busy_timeout و synchronous مبقتش لازمة على Turso،
+// لأن Turso بيتولّى التوازي بين الطلبات بنفسه.
+import { db } from "./sqlite.js";
 import { config } from "./config.js";
 
-mkdirSync(dirname(config.dbPath), { recursive: true });
-
-const db = new Database(config.dbPath);
-// إعدادات إنتاج: WAL = قراءة وكتابة بالتوازي من غير قفل، busy_timeout يمنع
-// أخطاء القفل اللحظي، synchronous=NORMAL توازن أمان/سرعة كويس مع WAL.
-db.pragma("journal_mode = WAL");
-db.pragma("busy_timeout = 5000");
-db.pragma("synchronous = NORMAL");
-db.pragma("foreign_keys = ON");
-
-db.exec(`
+await db.exec(`
   CREATE TABLE IF NOT EXISTS users (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at    TEXT NOT NULL,
@@ -306,57 +298,123 @@ db.exec(`
 
 /* ===================== Migrations ===================== */
 
-function hasColumn(table, col) {
-  return db
-    .prepare(`PRAGMA table_info(${table})`)
-    .all()
-    .some((c) => c.name === col);
+async function hasColumn(table, col) {
+  const cols = await db.columns(table);
+  return cols.includes(col);
 }
-function addColumnIfMissing(table, col, def) {
-  if (!hasColumn(table, col)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${def}`);
+async function addColumnIfMissing(table, col, def) {
+  if (!(await hasColumn(table, col))) await db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${def}`);
 }
 
 // كل جداول البيانات بقت per-user
 for (const t of ["entries", "finance", "health", "conversations", "goals", "conditions", "meals", "habits", "tasks", "ai_usage"]) {
-  addColumnIfMissing(t, "user_id", "INTEGER");
+  await addColumnIfMissing(t, "user_id", "INTEGER");
 }
-addColumnIfMissing("health", "body_region", "TEXT");
-addColumnIfMissing("finance", "category", "TEXT"); // أكل، مواصلات، فواتير...
-addColumnIfMissing("users", "email", "TEXT");          // التسجيل بالإيميل
-addColumnIfMissing("users", "password_hash", "TEXT");
-addColumnIfMissing("tasks", "completed_at", "TEXT");
-addColumnIfMissing("tasks", "reminded_at", "TEXT");
-addColumnIfMissing("assets", "items", "TEXT"); // تفصيل بنود الأصل (JSON) — مثلاً قطع الدهب
-addColumnIfMissing("tasks", "resources", "TEXT"); // موارد المهمة: وصف/روابط/مصادر
-addColumnIfMissing("goals", "resources", "TEXT"); // موارد الهدف: وصف/روابط/مصادر
-addColumnIfMissing("goals", "period", "TEXT");    // 'week' | 'month' | 'date' — null = مستمر بلا نهاية
-addColumnIfMissing("goals", "deadline", "TEXT");  // YYYY-MM-DD آخر يوم متابعة — null = مستمر
-db.prepare(`UPDATE tasks SET status = 'pending' WHERE status = 'open'`).run();
+await addColumnIfMissing("health", "body_region", "TEXT");
+await addColumnIfMissing("finance", "category", "TEXT"); // أكل، مواصلات، فواتير...
+await addColumnIfMissing("users", "email", "TEXT");          // التسجيل بالإيميل
+await addColumnIfMissing("users", "password_hash", "TEXT");
+await addColumnIfMissing("tasks", "completed_at", "TEXT");
+await addColumnIfMissing("tasks", "reminded_at", "TEXT");
+await addColumnIfMissing("assets", "items", "TEXT"); // تفصيل بنود الأصل (JSON) — مثلاً قطع الدهب
+await addColumnIfMissing("tasks", "resources", "TEXT"); // موارد المهمة: وصف/روابط/مصادر
+await addColumnIfMissing("goals", "resources", "TEXT"); // موارد الهدف: وصف/روابط/مصادر
+await addColumnIfMissing("goals", "period", "TEXT");    // 'week' | 'month' | 'date' — null = مستمر بلا نهاية
+await addColumnIfMissing("goals", "deadline", "TEXT");  // YYYY-MM-DD آخر يوم متابعة — null = مستمر
+(await db.prepare(`UPDATE tasks SET status = 'pending' WHERE status = 'open'`).run());
 
 // ===== إعدادات التطبيق (key/value) — بتتقدّم على الـ env (مثلاً مزود الذكاء ومفاتيحه) =====
-db.exec(`
+await db.exec(`
   CREATE TABLE IF NOT EXISTS app_settings (
     key        TEXT PRIMARY KEY,
     value      TEXT,
     updated_at TEXT NOT NULL
   );
 `);
-export function getSetting(key) {
-  return db.prepare(`SELECT value FROM app_settings WHERE key = ?`).get(key)?.value ?? null;
+// ===== الجلسات =====
+// لازم تكون في الداتابيز مش في الذاكرة: على Vercel كل طلب بيعمل instance
+// جديد، فالـ Map كان هيمسح كل تسجيلات الدخول عند أول cold start.
+await db.exec(`
+  CREATE TABLE IF NOT EXISTS sessions (
+    token      TEXT PRIMARY KEY,
+    kind       TEXT NOT NULL,   -- user | admin
+    subject_id INTEGER NOT NULL,-- user_id أو admin_id حسب النوع
+    expires_at INTEGER NOT NULL,-- ms epoch
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_sessions_exp ON sessions(expires_at);
+`);
+
+export async function createSession(token, kind, subjectId, expiresAt) {
+  await db
+    .prepare(`INSERT INTO sessions (token, kind, subject_id, expires_at, created_at) VALUES (?, ?, ?, ?, ?)`)
+    .run(token, kind, Number(subjectId), Number(expiresAt), now());
 }
-export function setSetting(key, value) {
+export async function getSession(token) {
+  return await db.prepare(`SELECT * FROM sessions WHERE token = ?`).get(String(token));
+}
+export async function deleteSession(token) {
+  return (await db.prepare(`DELETE FROM sessions WHERE token = ?`).run(String(token))).changes > 0;
+}
+export async function purgeExpiredSessions() {
+  return (await db.prepare(`DELETE FROM sessions WHERE expires_at < ?`).run(Date.now())).changes;
+}
+
+// ===== Rate limiting =====
+// كان Map في الذاكرة — يعني على Vercel كل cold start بيصفّر العداد
+// تعليق企图 تخمين كلمات السر. دلوقتي العداد عايش في الداتابيز.
+await db.exec(`
+  CREATE TABLE IF NOT EXISTS rate_limits (
+    bucket   TEXT NOT NULL,
+    key      TEXT NOT NULL,
+    count    INTEGER NOT NULL,
+    reset_at INTEGER NOT NULL,
+    PRIMARY KEY (bucket, key)
+  );
+  CREATE INDEX IF NOT EXISTS idx_rate_reset ON rate_limits(reset_at);
+`);
+
+export async function rateLimitBump(bucket, key, windowMs) {
+  const t = Date.now();
+  const row = await db.prepare(`SELECT * FROM rate_limits WHERE bucket = ? AND key = ?`).get(bucket, key);
+  let count;
+  let resetAt;
+  if (!row || t > row.reset_at) {
+    count = 0;
+    resetAt = t + windowMs;
+  } else {
+    count = row.count;
+    resetAt = row.reset_at;
+  }
+  count++;
+  await db
+    .prepare(
+      `INSERT INTO rate_limits (bucket, key, count, reset_at) VALUES (?, ?, ?, ?)
+       ON CONFLICT(bucket, key) DO UPDATE SET count = excluded.count, reset_at = excluded.reset_at`
+    )
+    .run(bucket, key, count, resetAt);
+  return { count, resetAt };
+}
+export async function purgeRateLimits() {
+  return (await db.prepare(`DELETE FROM rate_limits WHERE reset_at < ?`).run(Date.now())).changes;
+}
+
+export async function getSetting(key) {
+  return (await db.prepare(`SELECT value FROM app_settings WHERE key = ?`).get(key))?.value ?? null;
+}
+export async function setSetting(key, value) {
   if (value == null || value === "") {
-    db.prepare(`DELETE FROM app_settings WHERE key = ?`).run(key);
+    (await db.prepare(`DELETE FROM app_settings WHERE key = ?`).run(key));
     return;
   }
-  db.prepare(
+  (await db.prepare(
     `INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
-  ).run(key, String(value), new Date().toISOString());
+  ).run(key, String(value), new Date().toISOString()));
 }
 
 // ===== المتتبِّعات اليومية (أرقام بتتسجّل كل يوم: ساعات عمل، مياه، مذاكرة...) =====
-db.exec(`
+await db.exec(`
   CREATE TABLE IF NOT EXISTS metrics (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at    TEXT NOT NULL,
@@ -410,129 +468,136 @@ const insertUserStmt = db.prepare(
 );
 const ownerStmt = db.prepare(`SELECT * FROM users WHERE is_owner = 1 ORDER BY id LIMIT 1`);
 
-export function getUserById(id) {
-  return getUserByIdStmt.get(Number(id)) || null;
+export async function getUserById(id) {
+  return (await getUserByIdStmt.get(Number(id))) || null;
 }
 // تحديث آخر ظهور — بيتنده مع كل نشاط فعلي للمستخدم (مهم للتذكيرات والمستخدمين النشطين)
 const touchUserStmt = db.prepare(`UPDATE users SET last_seen = ? WHERE id = ?`);
-export function touchUser(id) {
-  if (id) touchUserStmt.run(now(), Number(id));
+export async function touchUser(id) {
+  if (id) (await touchUserStmt.run(now(), Number(id)));
 }
-export function ownerUser() {
-  return ownerStmt.get() || null;
+export async function ownerUser() {
+  return (await ownerStmt.get()) || null;
 }
-export function listUsers() {
-  return db.prepare(`SELECT * FROM users ORDER BY id`).all();
+export async function listUsers() {
+  return (await db.prepare(`SELECT * FROM users ORDER BY id`).all());
+}
+
+// بتستخدمها scripts/reset-password.js — بتشتغل على Turso والمحلي بنفس الكود
+export async function setUserPassword(userId, passwordHash) {
+  return (await db.prepare(`UPDATE users SET password_hash = ? WHERE id = ?`).run(passwordHash, userId)).changes > 0;
 }
 // المستخدمين النشطين بس (آخر ظهور خلال N يوم) — للمبادرة (check-in اليومي + التأمّل الأسبوعي)
-export function activeUsers(days = 14) {
+export async function activeUsers(days = 14) {
   const cutoff = new Date(Date.now() - days * 86400000).toISOString();
-  return db.prepare(`SELECT * FROM users WHERE last_seen >= ? ORDER BY id`).all(cutoff);
+  return (await db.prepare(`SELECT * FROM users WHERE last_seen >= ? ORDER BY id`).all(cutoff));
 }
 
 // المستخدمين النشطين اللي مسجّلوش أي يومية في تاريخ معيّن — لتذكير اليوميات اليومي
-export function activeUsersWithoutEntry(date, days = 14) {
+export async function activeUsersWithoutEntry(date, days = 14) {
   const cutoff = new Date(Date.now() - days * 86400000).toISOString();
-  return db
+  return (await db
     .prepare(
       `SELECT u.* FROM users u
        WHERE u.last_seen >= ?
          AND NOT EXISTS (SELECT 1 FROM entries e WHERE e.user_id = u.id AND e.entry_date = ?)
        ORDER BY u.id`
     )
-    .all(cutoff, date);
+    .all(cutoff, date));
 }
 
 /* ---- حسابات الإيميل ---- */
 
 const getUserByEmailStmt = db.prepare(`SELECT * FROM users WHERE email = ?`);
-export function getUserByEmail(email) {
+export async function getUserByEmail(email) {
   if (!email) return null;
-  return getUserByEmailStmt.get(String(email).trim().toLowerCase()) || null;
+  return (await getUserByEmailStmt.get(String(email).trim().toLowerCase())) || null;
 }
 
 // «مالك يقدر يسجّل دخول» = عنده إيميل وباسورد (مش المستخدم الوهمي بتاع bootstrap)
 const loginableOwnerStmt = db.prepare(
   `SELECT id FROM users WHERE is_owner = 1 AND email IS NOT NULL AND password_hash IS NOT NULL LIMIT 1`
 );
-export function setUserOwner(userId, isOwner) {
-  return db.prepare(`UPDATE users SET is_owner = ? WHERE id = ?`).run(isOwner ? 1 : 0, userId).changes > 0;
+export async function setUserOwner(userId, isOwner) {
+  return (await db.prepare(`UPDATE users SET is_owner = ? WHERE id = ?`).run(isOwner ? 1 : 0, userId)).changes > 0;
 }
 // عدد الملاك اللي يقدروا يسجّلوا دخول — عشان مانسحبش آخر ملكية ونقفل الإعدادات على الكل
-export function countLoginableOwners() {
-  return db.prepare(
+export async function countLoginableOwners() {
+  return (await db.prepare(
     `SELECT COUNT(*) c FROM users WHERE is_owner = 1 AND email IS NOT NULL AND password_hash IS NOT NULL`
-  ).get().c;
+  ).get()).c;
 }
 
-export function createEmailUser({ name, email, passwordHash }) {
+export async function createEmailUser({ name, email, passwordHash }) {
   const cleanEmail = String(email).trim().toLowerCase();
-  if (getUserByEmail(cleanEmail)) return null; // الإيميل مستخدم قبل كده
-  const info = db
+  if ((await getUserByEmail(cleanEmail))) return null; // الإيميل مستخدم قبل كده
+  const info = (await db
     .prepare(`INSERT INTO users (created_at, name, email, password_hash, last_seen) VALUES (?, ?, ?, ?, ?)`)
-    .run(now(), name || null, cleanEmail, passwordHash, now());
+    .run(now(), name || null, cleanEmail, passwordHash, now()));
   const id = Number(info.lastInsertRowid);
   // أول حساب حقيقي في أي نسخة = صاحب التطبيق، عشان يقدر يظبّط مزود الذكاء والتحديثات
   // من جوّه التطبيق. (المستخدم الوهمي بتاع bootstrap مالوش إيميل فمينفعش يسجّل دخول.)
-  if (!loginableOwnerStmt.get()) {
-    db.prepare(`UPDATE users SET is_owner = 0 WHERE email IS NULL`).run(); // شيل العلم من الوهمي
-    setUserOwner(id, true);
+  if (!(await loginableOwnerStmt.get())) {
+    (await db.prepare(`UPDATE users SET is_owner = 0 WHERE email IS NULL`).run()); // شيل العلم من الوهمي
+    (await setUserOwner(id, true));
   }
-  return getUserByIdStmt.get(id);
+  return (await getUserByIdStmt.get(id));
 }
 
 // bootstrap: نضمن وجود "صاحب" المنصة ونلحق البيانات القديمة (اللي من قبل multi-user) بيه
-(function bootstrapOwner() {
-  let owner = ownerStmt.get();
+// (نص top-level await — في ESM ده مستني لحد ما الـ DB يجهز، فأي حد بيعمل
+//  import لـ db.js هيستنى قبل ما يشتغل)
+{
+  let owner = await ownerStmt.get();
   if (!owner) {
-    const info = insertUserStmt.run(now(), null, "Owner", 1, now());
-    owner = getUserByIdStmt.get(Number(info.lastInsertRowid));
+    const info = await insertUserStmt.run(now(), null, "Owner", 1, now());
+    owner = await getUserByIdStmt.get(Number(info.lastInsertRowid));
   }
   for (const t of ["entries", "finance", "health", "conversations", "goals", "conditions", "meals", "habits", "tasks", "ai_usage"]) {
-    db.prepare(`UPDATE ${t} SET user_id = ? WHERE user_id IS NULL`).run(owner.id);
+    await db.prepare(`UPDATE ${t} SET user_id = ? WHERE user_id IS NULL`).run(owner.id);
   }
   // لو النسخة فيها حسابات حقيقية بس ولا واحد فيهم مالك (الملكية عند المستخدم الوهمي)،
   // نسلّم الملكية لأقدم حساب حقيقي — غير كده محدش هيقدر يفتح إعدادات التطبيق.
-  if (!loginableOwnerStmt.get()) {
-    const first = db
+  if (!(await loginableOwnerStmt.get())) {
+    const first = await db
       .prepare(`SELECT id FROM users WHERE email IS NOT NULL AND password_hash IS NOT NULL ORDER BY id LIMIT 1`)
       .get();
     if (first) {
-      db.prepare(`UPDATE users SET is_owner = 0 WHERE email IS NULL`).run();
-      db.prepare(`UPDATE users SET is_owner = 1 WHERE id = ?`).run(first.id);
+      await db.prepare(`UPDATE users SET is_owner = 0 WHERE email IS NULL`).run();
+      await db.prepare(`UPDATE users SET is_owner = 1 WHERE id = ?`).run(first.id);
       console.log(`👑 اتسلّمت ملكية التطبيق للحساب #${first.id} (أقدم حساب) — يقدر يظبّط الإعدادات من جوّه التطبيق`);
     }
   }
-})();
+}
 
 /* ===================== Admins (حساب منفصل للوحة المنصة) ===================== */
 
-export function getAdminByUsername(username) {
+export async function getAdminByUsername(username) {
   if (!username) return null;
-  return db.prepare(`SELECT * FROM admins WHERE username = ?`).get(String(username).trim().toLowerCase()) || null;
+  return (await db.prepare(`SELECT * FROM admins WHERE username = ?`).get(String(username).trim().toLowerCase())) || null;
 }
-export function countAdmins() {
-  return db.prepare(`SELECT COUNT(*) AS n FROM admins`).get().n;
+export async function countAdmins() {
+  return (await db.prepare(`SELECT COUNT(*) AS n FROM admins`).get()).n;
 }
-export function createAdmin({ username, passwordHash }) {
+export async function createAdmin({ username, passwordHash }) {
   const u = String(username).trim().toLowerCase();
   if (!u || !passwordHash) return null;
-  if (getAdminByUsername(u)) return null;
-  const info = db.prepare(`INSERT INTO admins (created_at, username, password_hash) VALUES (?, ?, ?)`).run(now(), u, passwordHash);
-  return db.prepare(`SELECT * FROM admins WHERE id = ?`).get(Number(info.lastInsertRowid));
+  if ((await getAdminByUsername(u))) return null;
+  const info = (await db.prepare(`INSERT INTO admins (created_at, username, password_hash) VALUES (?, ?, ?)`).run(now(), u, passwordHash));
+  return (await db.prepare(`SELECT * FROM admins WHERE id = ?`).get(Number(info.lastInsertRowid)));
 }
-export function touchAdminLogin(id) {
-  db.prepare(`UPDATE admins SET last_login = ? WHERE id = ?`).run(now(), id);
+export async function touchAdminLogin(id) {
+  (await db.prepare(`UPDATE admins SET last_login = ? WHERE id = ?`).run(now(), id));
 }
-export function getAdminById(id) {
-  return db.prepare(`SELECT * FROM admins WHERE id = ?`).get(Number(id)) || null;
+export async function getAdminById(id) {
+  return (await db.prepare(`SELECT * FROM admins WHERE id = ?`).get(Number(id))) || null;
 }
 
 /* ===================== إحصائيات المنصة (للأدمن) ===================== */
 
 // كل المستخدمين مع عدد بياناتهم في كل محور — لجدول لوحة الأدمن
-export function listUsersWithStats() {
-  return db
+export async function listUsersWithStats() {
+  return (await db
     .prepare(
       `SELECT u.id, u.name, u.email, u.last_seen, u.created_at, u.is_owner,
          (SELECT COUNT(*) FROM push_subscriptions p WHERE p.user_id = u.id) AS push,
@@ -547,24 +612,24 @@ export function listUsersWithStats() {
        FROM users u
        ORDER BY u.last_seen IS NULL, u.last_seen DESC`
     )
-    .all();
+    .all());
 }
 
-export function platformStats() {
+export async function platformStats() {
   const cutoff = new Date(Date.now() - 14 * 86400000).toISOString();
-  const one = (sql, ...p) => db.prepare(sql).get(...p);
+  const one = async (sql, ...p) => await db.prepare(sql).get(...p);
   return {
-    users: one(`SELECT COUNT(*) AS n FROM users`).n,
-    with_push: one(`SELECT COUNT(DISTINCT user_id) AS n FROM push_subscriptions`).n,
-    with_email: one(`SELECT COUNT(*) AS n FROM users WHERE email IS NOT NULL`).n,
-    active_14d: one(`SELECT COUNT(*) AS n FROM users WHERE last_seen >= ?`, cutoff).n,
-    entries: one(`SELECT COUNT(*) AS n FROM entries`).n,
-    finance: one(`SELECT COUNT(*) AS n FROM finance`).n,
-    health: one(`SELECT COUNT(*) AS n FROM health`).n,
-    tasks: one(`SELECT COUNT(*) AS n FROM tasks`).n,
-    conversations: one(`SELECT COUNT(*) AS n FROM conversations`).n,
-    ai_cost_total: one(`SELECT COALESCE(SUM(cost_usd),0) AS c FROM ai_usage`).c,
-    ai_cost_month: one(`SELECT COALESCE(SUM(cost_usd),0) AS c FROM ai_usage WHERE usage_date >= ?`, today().slice(0, 8) + "01").c,
+    users: (await one(`SELECT COUNT(*) AS n FROM users`)).n,
+    with_push: (await one(`SELECT COUNT(DISTINCT user_id) AS n FROM push_subscriptions`)).n,
+    with_email: (await one(`SELECT COUNT(*) AS n FROM users WHERE email IS NOT NULL`)).n,
+    active_14d: (await one(`SELECT COUNT(*) AS n FROM users WHERE last_seen >= ?`, cutoff)).n,
+    entries: (await one(`SELECT COUNT(*) AS n FROM entries`)).n,
+    finance: (await one(`SELECT COUNT(*) AS n FROM finance`)).n,
+    health: (await one(`SELECT COUNT(*) AS n FROM health`)).n,
+    tasks: (await one(`SELECT COUNT(*) AS n FROM tasks`)).n,
+    conversations: (await one(`SELECT COUNT(*) AS n FROM conversations`)).n,
+    ai_cost_total: (await one(`SELECT COALESCE(SUM(cost_usd),0) AS c FROM ai_usage`)).c,
+    ai_cost_month: (await one(`SELECT COALESCE(SUM(cost_usd),0) AS c FROM ai_usage WHERE usage_date >= ?`, today().slice(0, 8) + "01")).c,
   };
 }
 
@@ -583,8 +648,8 @@ const updateJournalStmt = db.prepare(`
 `);
 
 // لو فيه تدوينة لنفس اليوم، نضيف عليها بدل ما نعمل واحدة جديدة
-export function upsertJournalForDay({ userId, entryDate, mood, summary, tags, transcript, raw }) {
-  const existing = journalForDayStmt.get(userId, entryDate);
+export async function upsertJournalForDay({ userId, entryDate, mood, summary, tags, transcript, raw }) {
+  const existing = (await journalForDayStmt.get(userId, entryDate));
   if (existing) {
     const mergedTranscript = `${existing.transcript}\n\n${transcript}`.trim();
     // ماننفعش نلزق الملخصات ورا بعض (كان بيطلع بلوك مكرر ضخم لو اليوم فيه كذا تسجيل) —
@@ -592,17 +657,17 @@ export function upsertJournalForDay({ userId, entryDate, mood, summary, tags, tr
     const cand = [existing.summary, summary].filter(Boolean);
     const mergedSummary = cand.sort((a, b) => b.length - a.length)[0] || null;
     const mergedTags = [...new Set([...parseJson(existing.tags, []), ...(tags ?? [])])];
-    updateJournalStmt.run(
+    (await updateJournalStmt.run(
       mood ?? existing.mood ?? null,
       mergedSummary || null,
       JSON.stringify(mergedTags),
       mergedTranscript,
       JSON.stringify(raw ?? {}),
       existing.id
-    );
+    ));
     return { id: existing.id, merged: true };
   }
-  const info = insertJournalStmt.run(
+  const info = (await insertJournalStmt.run(
     now(),
     userId,
     entryDate,
@@ -611,19 +676,19 @@ export function upsertJournalForDay({ userId, entryDate, mood, summary, tags, tr
     JSON.stringify(tags ?? []),
     transcript,
     JSON.stringify(raw ?? {})
-  );
+  ));
   return { id: Number(info.lastInsertRowid), merged: false };
 }
 
 // تصحيح/تعديل نص يوميات يوم معيّن (استبدال كلمة/جملة) — للتعديل بالصوت
-export function correctJournal(userId, date, find, replace) {
+export async function correctJournal(userId, date, find, replace) {
   if (!find) return { changed: false };
-  const info = db
+  const info = (await db
     .prepare(
       `UPDATE entries SET summary = REPLACE(summary, ?, ?)
        WHERE user_id = ? AND entry_date = ? AND summary LIKE '%' || ? || '%'`
     )
-    .run(find, replace ?? "", userId, date, find);
+    .run(find, replace ?? "", userId, date, find));
   return { changed: info.changes > 0 };
 }
 
@@ -631,20 +696,20 @@ const listEntriesStmt = db.prepare(
   `SELECT id, created_at, entry_date, mood, summary, tags, transcript
    FROM entries WHERE user_id = ? ORDER BY entry_date DESC, id DESC LIMIT ?`
 );
-export function listEntries(userId, limit = 100) {
-  return listEntriesStmt.all(userId, limit).map((r) => ({ ...r, tags: parseJson(r.tags, []) }));
+export async function listEntries(userId, limit = 100) {
+  return (await listEntriesStmt.all(userId, limit)).map((r) => ({ ...r, tags: parseJson(r.tags, []) }));
 }
 
 const entriesSinceStmt = db.prepare(
   `SELECT entry_date, mood, summary, transcript
    FROM entries WHERE user_id = ? AND entry_date >= ? ORDER BY entry_date ASC, id ASC`
 );
-export function entriesSince(userId, dateStr) {
-  return entriesSinceStmt.all(userId, dateStr);
+export async function entriesSince(userId, dateStr) {
+  return (await entriesSinceStmt.all(userId, dateStr));
 }
 
-export function deleteEntry(userId, id) {
-  return db.prepare(`DELETE FROM entries WHERE user_id = ? AND id = ?`).run(userId, id).changes > 0;
+export async function deleteEntry(userId, id) {
+  return (await db.prepare(`DELETE FROM entries WHERE user_id = ? AND id = ?`).run(userId, id)).changes > 0;
 }
 
 /* ===================== Finance (ماليات) ===================== */
@@ -684,7 +749,7 @@ const insertFinanceStmt = db.prepare(`
 const findDupFinanceStmt = db.prepare(
   `SELECT id, note FROM finance WHERE user_id = ? AND entry_date = ? AND direction = ? AND amount = ?`
 );
-export function addFinance({ userId, entryDate, direction, amount, currency, category, note }) {
+export async function addFinance({ userId, entryDate, direction, amount, currency, category, note }) {
   const eDate = entryDate || today();
   const dir = direction === "income" ? "income" : "expense";
   const amt = Number(amount) || 0;
@@ -693,9 +758,9 @@ export function addFinance({ userId, entryDate, direction, amount, currency, cat
   // بنمنع التكرار بس لما فيه ملاحظة فعلية مطابقة — عشان منخلطش مصروفين حقيقيين
   // بنفس المبلغ ومن غير وصف (دول بيفضلوا منفصلين).
   const nn = normNote(note);
-  const existing = nn ? findDupFinanceStmt.all(userId, eDate, dir, amt).find((r) => normNote(r.note) === nn) : null;
+  const existing = nn ? (await findDupFinanceStmt.all(userId, eDate, dir, amt)).find((r) => normNote(r.note) === nn) : null;
   if (existing) return Number(existing.id);
-  const info = insertFinanceStmt.run(
+  const info = (await insertFinanceStmt.run(
     now(),
     userId,
     eDate,
@@ -704,9 +769,9 @@ export function addFinance({ userId, entryDate, direction, amount, currency, cat
     currency || "جنيه",
     category && FINANCE_CATEGORIES.includes(category) ? category : category || "أخرى",
     note || null
-  );
+  ));
   // ربط تلقائي: الدخل/الصرف بعملة معيّنة يزوّد/ينقّص أي هدف بنفس الوحدة (مثلاً هدف «دولار»)
-  try { applyFinanceToGoals(userId, dir, amt, currency, note, 1); } catch {}
+  try { (await applyFinanceToGoals(userId, dir, amt, currency, note, 1)); } catch {}
   return Number(info.lastInsertRowid);
 }
 // تطبيع اسم العملة لكود موحّد
@@ -721,46 +786,46 @@ function normCurKey(s) {
   return x;
 }
 // يزوّد/ينقّص أي هدف وحدته نفس عملة العملية (sign=1 إضافة، sign=-1 تراجع عند الحذف)
-function applyFinanceToGoals(userId, dir, amount, currency, note, sign) {
+async function applyFinanceToGoals(userId, dir, amount, currency, note, sign) {
   const amt = Number(amount) || 0;
   if (!amt) return;
   const ck = normCurKey(currency || "جنيه");
-  const gs = db.prepare(`SELECT id, current, unit FROM goals WHERE user_id = ?`).all(userId)
+  const gs = (await db.prepare(`SELECT id, current, unit FROM goals WHERE user_id = ?`).all(userId))
     .filter((g) => g.unit && normCurKey(g.unit) === ck);
   const delta = (dir === "income" ? amt : -amt) * (sign || 1);
   for (const g of gs) {
     const nc = Math.max(0, (Number(g.current) || 0) + delta);
-    db.prepare(`UPDATE goals SET current = ?, updated_at = ? WHERE id = ? AND user_id = ?`).run(nc, now(), g.id, userId);
-    logGoalChange(userId, g.id, nc - (Number(g.current) || 0), nc, (sign < 0 ? "تراجع · " : "") + (dir === "income" ? "دخل" : "صرف") + (note ? " · " + note : ""));
+    (await db.prepare(`UPDATE goals SET current = ?, updated_at = ? WHERE id = ? AND user_id = ?`).run(nc, now(), g.id, userId));
+    (await logGoalChange(userId, g.id, nc - (Number(g.current) || 0), nc, (sign < 0 ? "تراجع · " : "") + (dir === "income" ? "دخل" : "صرف") + (note ? " · " + note : "")));
   }
 }
 
 const listFinanceStmt = db.prepare(
   `SELECT * FROM finance WHERE user_id = ? ORDER BY entry_date DESC, id DESC LIMIT ?`
 );
-export function listFinance(userId, limit = 500) {
-  return listFinanceStmt.all(userId, limit);
+export async function listFinance(userId, limit = 500) {
+  return (await listFinanceStmt.all(userId, limit));
 }
 
 const financeSinceStmt = db.prepare(
   `SELECT * FROM finance WHERE user_id = ? AND entry_date >= ? ORDER BY entry_date ASC`
 );
-export function financeSince(userId, dateStr) {
-  return financeSinceStmt.all(userId, dateStr);
+export async function financeSince(userId, dateStr) {
+  return (await financeSinceStmt.all(userId, dateStr));
 }
 
 const financeBetweenStmt = db.prepare(
   `SELECT * FROM finance WHERE user_id = ? AND entry_date >= ? AND entry_date <= ? ORDER BY entry_date ASC`
 );
-export function financeBetween(userId, from, to) {
-  return financeBetweenStmt.all(userId, from, to);
+export async function financeBetween(userId, from, to) {
+  return (await financeBetweenStmt.all(userId, from, to));
 }
 
-export function deleteFinance(userId, id) {
-  const row = db.prepare(`SELECT direction, amount, currency, note FROM finance WHERE user_id = ? AND id = ?`).get(userId, id);
-  const ok = db.prepare(`DELETE FROM finance WHERE user_id = ? AND id = ?`).run(userId, id).changes > 0;
+export async function deleteFinance(userId, id) {
+  const row = (await db.prepare(`SELECT direction, amount, currency, note FROM finance WHERE user_id = ? AND id = ?`).get(userId, id));
+  const ok = (await db.prepare(`DELETE FROM finance WHERE user_id = ? AND id = ?`).run(userId, id)).changes > 0;
   // رجّع تأثير العملية على الهدف اللي بنفس العملة (عشان الحذف وإعادة الإضافة ميكررش)
-  if (ok && row) { try { applyFinanceToGoals(userId, row.direction, row.amount, row.currency, row.note, -1); } catch {} }
+  if (ok && row) { try { (await applyFinanceToGoals(userId, row.direction, row.amount, row.currency, row.note, -1)); } catch {} }
   return ok;
 }
 
@@ -770,8 +835,8 @@ const insertHealthStmt = db.prepare(`
   INSERT INTO health (created_at, user_id, entry_date, at_time, category, detail, body_region)
   VALUES (?, ?, ?, ?, ?, ?, ?)
 `);
-export function addHealth({ userId, entryDate, atTime, category, detail, bodyRegion }) {
-  const info = insertHealthStmt.run(
+export async function addHealth({ userId, entryDate, atTime, category, detail, bodyRegion }) {
+  const info = (await insertHealthStmt.run(
     now(),
     userId,
     entryDate || today(),
@@ -779,48 +844,48 @@ export function addHealth({ userId, entryDate, atTime, category, detail, bodyReg
     category || "ملاحظة",
     detail,
     bodyRegion || "عام"
-  );
+  ));
   return Number(info.lastInsertRowid);
 }
 
 const listHealthStmt = db.prepare(
   `SELECT * FROM health WHERE user_id = ? ORDER BY entry_date DESC, id DESC LIMIT ?`
 );
-export function listHealth(userId, limit = 500) {
-  return listHealthStmt.all(userId, limit);
+export async function listHealth(userId, limit = 500) {
+  return (await listHealthStmt.all(userId, limit));
 }
 
 const healthSinceStmt = db.prepare(
   `SELECT * FROM health WHERE user_id = ? AND entry_date >= ? ORDER BY entry_date ASC, id ASC`
 );
-export function healthSince(userId, dateStr) {
-  return healthSinceStmt.all(userId, dateStr);
+export async function healthSince(userId, dateStr) {
+  return (await healthSinceStmt.all(userId, dateStr));
 }
 
 const entriesBetweenStmt = db.prepare(
   `SELECT * FROM entries WHERE user_id = ? AND entry_date >= ? AND entry_date <= ? ORDER BY entry_date ASC, id ASC`
 );
-export function entriesBetween(userId, from, to) {
-  return entriesBetweenStmt.all(userId, from, to);
+export async function entriesBetween(userId, from, to) {
+  return (await entriesBetweenStmt.all(userId, from, to));
 }
 
 const mealsBetweenStmt = db.prepare(
   `SELECT * FROM meals WHERE user_id = ? AND entry_date >= ? AND entry_date <= ? ORDER BY entry_date ASC, id ASC`
 );
-export function mealsBetween(userId, from, to) {
-  return mealsBetweenStmt.all(userId, from, to);
+export async function mealsBetween(userId, from, to) {
+  return (await mealsBetweenStmt.all(userId, from, to));
 }
 
 const healthBetweenStmt = db.prepare(
   `SELECT * FROM health WHERE user_id = ? AND entry_date >= ? AND entry_date <= ?
    ORDER BY entry_date ASC, id ASC`
 );
-export function healthBetween(userId, startDate, endDate) {
-  return healthBetweenStmt.all(userId, startDate, endDate);
+export async function healthBetween(userId, startDate, endDate) {
+  return (await healthBetweenStmt.all(userId, startDate, endDate));
 }
 
-export function deleteHealth(userId, id) {
-  return db.prepare(`DELETE FROM health WHERE user_id = ? AND id = ?`).run(userId, id).changes > 0;
+export async function deleteHealth(userId, id) {
+  return (await db.prepare(`DELETE FROM health WHERE user_id = ? AND id = ?`).run(userId, id)).changes > 0;
 }
 
 /* ===================== Goals (أهداف) ===================== */
@@ -856,9 +921,9 @@ export function goalExpired(g, today = localToday()) {
 }
 
 // منطق ذكي: لو الهدف موجود نحدّثه/نزوّد التقدّم، لو لأ ننشئه
-export function applyGoal({ userId, title, target, addAmount, setCurrent, unit, note, period, deadline }) {
+export async function applyGoal({ userId, title, target, addAmount, setCurrent, unit, note, period, deadline }) {
   if (!title) return null;
-  const existing = findGoalStmt.get(userId, `%${title.trim()}%`);
+  const existing = (await findGoalStmt.get(userId, `%${title.trim()}%`));
   if (existing) {
     let current = existing.current;
     if (setCurrent != null) current = Number(setCurrent);
@@ -869,7 +934,7 @@ export function applyGoal({ userId, title, target, addAmount, setCurrent, unit, 
       deadline !== undefined || period !== undefined
         ? computeDeadline(period !== undefined ? period : existing.period, deadline, existing.created_at?.slice(0, 10))
         : existing.deadline;
-    updateGoalStmt.run(
+    (await updateGoalStmt.run(
       now(),
       existing.title,
       target != null ? Number(target) : existing.target,
@@ -879,8 +944,8 @@ export function applyGoal({ userId, title, target, addAmount, setCurrent, unit, 
       newPeriod,
       newDeadline,
       existing.id
-    );
-    logGoalChange(userId, existing.id, current - existing.current, current, note || null);
+    ));
+    (await logGoalChange(userId, existing.id, current - existing.current, current, note || null));
     return {
       id: existing.id,
       created: false,
@@ -893,7 +958,7 @@ export function applyGoal({ userId, title, target, addAmount, setCurrent, unit, 
   let current = 0;
   if (setCurrent != null) current = Number(setCurrent);
   if (addAmount != null) current += Number(addAmount);
-  const info = insertGoalStmt.run(
+  const info = (await insertGoalStmt.run(
     now(),
     now(),
     userId,
@@ -904,8 +969,8 @@ export function applyGoal({ userId, title, target, addAmount, setCurrent, unit, 
     note || null,
     period || null,
     computeDeadline(period, deadline)
-  );
-  logGoalChange(userId, Number(info.lastInsertRowid), current, current, note || "هدف جديد");
+  ));
+  (await logGoalChange(userId, Number(info.lastInsertRowid), current, current, note || "هدف جديد"));
   return {
     id: Number(info.lastInsertRowid),
     created: true,
@@ -916,51 +981,51 @@ export function applyGoal({ userId, title, target, addAmount, setCurrent, unit, 
   };
 }
 
-export function listGoals(userId) {
-  return db.prepare(`SELECT * FROM goals WHERE user_id = ? ORDER BY id DESC`).all(userId);
+export async function listGoals(userId) {
+  return (await db.prepare(`SELECT * FROM goals WHERE user_id = ? ORDER BY id DESC`).all(userId));
 }
-export function deleteGoal(userId, id) {
-  return db.prepare(`DELETE FROM goals WHERE user_id = ? AND id = ?`).run(userId, id).changes > 0;
+export async function deleteGoal(userId, id) {
+  return (await db.prepare(`DELETE FROM goals WHERE user_id = ? AND id = ?`).run(userId, id)).changes > 0;
 }
-export function setGoalCurrent(userId, id, current) {
-  const g = db.prepare(`SELECT current FROM goals WHERE user_id = ? AND id = ?`).get(userId, id);
+export async function setGoalCurrent(userId, id, current) {
+  const g = (await db.prepare(`SELECT current FROM goals WHERE user_id = ? AND id = ?`).get(userId, id));
   if (!g) return false;
   const ok =
-    db
+    (await db
       .prepare(`UPDATE goals SET current = ?, updated_at = ? WHERE user_id = ? AND id = ?`)
-      .run(Number(current), now(), userId, id).changes > 0;
-  if (ok) logGoalChange(userId, id, Number(current) - g.current, Number(current), "تحديث يدوي");
+      .run(Number(current), now(), userId, id)).changes > 0;
+  if (ok) (await logGoalChange(userId, id, Number(current) - g.current, Number(current), "تحديث يدوي"));
   return ok;
 }
 
 const insertGoalLogStmt = db.prepare(
   `INSERT INTO goal_log (created_at, user_id, goal_id, delta, current_after, note) VALUES (?, ?, ?, ?, ?, ?)`
 );
-export function logGoalChange(userId, goalId, delta, currentAfter, note) {
-  insertGoalLogStmt.run(now(), userId, goalId, delta == null ? null : Number(delta), Number(currentAfter), note || null);
+export async function logGoalChange(userId, goalId, delta, currentAfter, note) {
+  (await insertGoalLogStmt.run(now(), userId, goalId, delta == null ? null : Number(delta), Number(currentAfter), note || null));
 }
-export function goalLog(userId, goalId, limit = 60) {
-  return db
+export async function goalLog(userId, goalId, limit = 60) {
+  return (await db
     .prepare(
       `SELECT id, created_at, delta, current_after, note FROM goal_log
        WHERE user_id = ? AND goal_id = ? ORDER BY created_at DESC, id DESC LIMIT ?`
     )
-    .all(userId, goalId, limit);
+    .all(userId, goalId, limit));
 }
 // حذف بند من سجل الهدف + تعديل رصيد الهدف بطرح الدلتا بتاعته (لو غلط)
-export function deleteGoalLog(userId, logId) {
-  const row = db.prepare(`SELECT goal_id, delta FROM goal_log WHERE id = ? AND user_id = ?`).get(logId, userId);
+export async function deleteGoalLog(userId, logId) {
+  const row = (await db.prepare(`SELECT goal_id, delta FROM goal_log WHERE id = ? AND user_id = ?`).get(logId, userId));
   if (!row) return false;
-  db.prepare(`DELETE FROM goal_log WHERE id = ? AND user_id = ?`).run(logId, userId);
+  (await db.prepare(`DELETE FROM goal_log WHERE id = ? AND user_id = ?`).run(logId, userId));
   if (row.delta != null) {
-    db.prepare(`UPDATE goals SET current = MAX(0, current - ?), updated_at = ? WHERE id = ? AND user_id = ?`)
-      .run(Number(row.delta), now(), row.goal_id, userId);
+    (await db.prepare(`UPDATE goals SET current = MAX(0, current - ?), updated_at = ? WHERE id = ? AND user_id = ?`)
+      .run(Number(row.delta), now(), row.goal_id, userId));
   }
   return true;
 }
 // تعديل بند في سجل الهدف: التفاصيل (note) و/أو المبلغ (delta) — وبيعدّل رصيد الهدف بالفرق
-export function updateGoalLog(userId, logId, { delta, note } = {}) {
-  const row = db.prepare(`SELECT goal_id, delta FROM goal_log WHERE id = ? AND user_id = ?`).get(logId, userId);
+export async function updateGoalLog(userId, logId, { delta, note } = {}) {
+  const row = (await db.prepare(`SELECT goal_id, delta FROM goal_log WHERE id = ? AND user_id = ?`).get(logId, userId));
   if (!row) return false;
   const sets = [], vals = [];
   if (note !== undefined) { sets.push("note = ?"); vals.push(note || null); }
@@ -968,12 +1033,12 @@ export function updateGoalLog(userId, logId, { delta, note } = {}) {
     const diff = Number(delta) - Number(row.delta || 0);
     sets.push("delta = ?"); vals.push(Number(delta));
     sets.push("current_after = current_after + ?"); vals.push(diff);
-    db.prepare(`UPDATE goals SET current = MAX(0, current + ?), updated_at = ? WHERE id = ? AND user_id = ?`)
-      .run(diff, now(), row.goal_id, userId);
+    (await db.prepare(`UPDATE goals SET current = MAX(0, current + ?), updated_at = ? WHERE id = ? AND user_id = ?`)
+      .run(diff, now(), row.goal_id, userId));
   }
   if (sets.length) {
     vals.push(logId, userId);
-    db.prepare(`UPDATE goal_log SET ${sets.join(", ")} WHERE id = ? AND user_id = ?`).run(...vals);
+    (await db.prepare(`UPDATE goal_log SET ${sets.join(", ")} WHERE id = ? AND user_id = ?`).run(...vals));
   }
   return true;
 }
@@ -992,68 +1057,69 @@ const findMetricStmt = db.prepare(
   `SELECT * FROM metrics WHERE user_id = ? AND title = ? AND archived = 0 ORDER BY id DESC LIMIT 1`
 );
 // أنشئ متتبِّع أو حدّث بياناته (بالعنوان — زي الأهداف)
-export function upsertMetric({ userId, title, unit, emoji, dailyTarget }) {
+export async function upsertMetric({ userId, title, unit, emoji, dailyTarget }) {
   if (!title) return null;
-  const existing = findMetricStmt.get(userId, title.trim());
+  const existing = (await findMetricStmt.get(userId, title.trim()));
   if (existing) {
     const sets = [], vals = [];
     if (unit) { sets.push("unit = ?"); vals.push(unit); }
     if (emoji) { sets.push("emoji = ?"); vals.push(emoji); }
     if (dailyTarget !== undefined) { sets.push("daily_target = ?"); vals.push(dailyTarget === "" || dailyTarget == null ? null : Number(dailyTarget)); }
-    if (sets.length) { vals.push(existing.id, userId); db.prepare(`UPDATE metrics SET ${sets.join(", ")} WHERE id = ? AND user_id = ?`).run(...vals); }
+    if (sets.length) { vals.push(existing.id, userId); (await db.prepare(`UPDATE metrics SET ${sets.join(", ")} WHERE id = ? AND user_id = ?`).run(...vals)); }
     return { ...existing, created: false };
   }
-  const info = db.prepare(`INSERT INTO metrics (created_at, user_id, title, unit, emoji, daily_target) VALUES (?, ?, ?, ?, ?, ?)`)
-    .run(now(), userId, title.trim(), unit || null, emoji || null, dailyTarget === "" || dailyTarget == null ? null : Number(dailyTarget));
+  const info = (await db.prepare(`INSERT INTO metrics (created_at, user_id, title, unit, emoji, daily_target) VALUES (?, ?, ?, ?, ?, ?)`)
+    .run(now(), userId, title.trim(), unit || null, emoji || null, dailyTarget === "" || dailyTarget == null ? null : Number(dailyTarget)));
   return { id: Number(info.lastInsertRowid), title: title.trim(), unit: unit || null, emoji: emoji || null, daily_target: dailyTarget ?? null, created: true };
 }
 // سجّل قيمة يوم (بيعمل replace لقيمة نفس اليوم لو موجودة — «النهاردة اشتغلت ٦ ساعات» = يوم النهاردة 6)
-export function logMetric({ userId, title, value, date, note, unit, emoji, dailyTarget }) {
+export async function logMetric({ userId, title, value, date, note, unit, emoji, dailyTarget }) {
   if (!title) return null;
   const v = cleanMetricValue(value);
   if (v == null) return null; // قيمة غير صالحة (فاضية/NaN/سالب) — ماتسجّلش
-  const m = upsertMetric({ userId, title, unit, emoji, dailyTarget });
+  const m = (await upsertMetric({ userId, title, unit, emoji, dailyTarget }));
   if (!m) return null;
   const d = normMetricDate(date);
-  const ex = db.prepare(`SELECT id FROM metric_logs WHERE user_id = ? AND metric_id = ? AND entry_date = ?`).get(userId, m.id, d);
-  if (ex) db.prepare(`UPDATE metric_logs SET value = ?, note = ?, created_at = ? WHERE id = ?`).run(v, note || null, now(), ex.id);
-  else db.prepare(`INSERT INTO metric_logs (created_at, user_id, metric_id, entry_date, value, note) VALUES (?, ?, ?, ?, ?, ?)`).run(now(), userId, m.id, d, v, note || null);
+  const ex = (await db.prepare(`SELECT id FROM metric_logs WHERE user_id = ? AND metric_id = ? AND entry_date = ?`).get(userId, m.id, d));
+  if (ex) (await db.prepare(`UPDATE metric_logs SET value = ?, note = ?, created_at = ? WHERE id = ?`).run(v, note || null, now(), ex.id));
+  else (await db.prepare(`INSERT INTO metric_logs (created_at, user_id, metric_id, entry_date, value, note) VALUES (?, ?, ?, ?, ?, ?)`).run(now(), userId, m.id, d, v, note || null));
   return { metric: m.title, id: m.id, date: d, value: v, unit: m.unit, created: m.created };
 }
-function metricStats(userId, metricId, today) {
+async function metricStats(userId, metricId, today) {
   const wk = addDaysISO(today, -6), mo = addDaysISO(today, -29);
-  const t = db.prepare(`SELECT value FROM metric_logs WHERE user_id=? AND metric_id=? AND entry_date=?`).get(userId, metricId, today);
-  const w = db.prepare(`SELECT SUM(value) s, AVG(value) a FROM metric_logs WHERE user_id=? AND metric_id=? AND entry_date>=?`).get(userId, metricId, wk);
-  const m = db.prepare(`SELECT SUM(value) s FROM metric_logs WHERE user_id=? AND metric_id=? AND entry_date>=?`).get(userId, metricId, mo);
-  const last7 = db.prepare(`SELECT entry_date, value FROM metric_logs WHERE user_id=? AND metric_id=? AND entry_date>=? ORDER BY entry_date`).all(userId, metricId, wk);
+  const t = (await db.prepare(`SELECT value FROM metric_logs WHERE user_id=? AND metric_id=? AND entry_date=?`).get(userId, metricId, today));
+  const w = (await db.prepare(`SELECT SUM(value) s, AVG(value) a FROM metric_logs WHERE user_id=? AND metric_id=? AND entry_date>=?`).get(userId, metricId, wk));
+  const m = (await db.prepare(`SELECT SUM(value) s FROM metric_logs WHERE user_id=? AND metric_id=? AND entry_date>=?`).get(userId, metricId, mo));
+  const last7 = (await db.prepare(`SELECT entry_date, value FROM metric_logs WHERE user_id=? AND metric_id=? AND entry_date>=? ORDER BY entry_date`).all(userId, metricId, wk));
   // مفاتيح أيام الرسم بتوقيت السيرفر (القاهرة) — عشان العميل مايحسبش بـ UTC ويطلع مزحلق يوم
   const spark_days = [];
   for (let i = 6; i >= 0; i--) spark_days.push(addDaysISO(today, -i));
   // avg = متوسط الأيام المسجّلة فعلاً (مش ÷٧) — والتسمية في الواجهة «المتوسط» عشان تطابق الحساب
   return { today: t ? t.value : null, week_total: w.s || 0, week_avg: w.a ? Math.round(w.a * 10) / 10 : 0, month_total: m.s || 0, last7, spark_days };
 }
-export function listMetricsWithStats(userId) {
+export async function listMetricsWithStats(userId) {
   const today = localToday();
-  return db.prepare(`SELECT * FROM metrics WHERE user_id=? AND archived=0 ORDER BY id DESC`).all(userId)
-    .map((m) => ({ ...m, stats: metricStats(userId, m.id, today) }));
+  const rows = (await db.prepare(`SELECT * FROM metrics WHERE user_id=? AND archived=0 ORDER BY id DESC`).all(userId));
+  // Promise.all لازم: map async بترجّع array of Promise، مش array من القيم
+  return Promise.all(rows.map(async (m) => ({ ...m, stats: await metricStats(userId, m.id, today) })));
 }
-export function metricHistory(userId, metricId, limit = 90) {
-  return db.prepare(`SELECT id, entry_date, value, note FROM metric_logs WHERE user_id=? AND metric_id=? ORDER BY entry_date DESC LIMIT ?`).all(userId, metricId, limit);
+export async function metricHistory(userId, metricId, limit = 90) {
+  return (await db.prepare(`SELECT id, entry_date, value, note FROM metric_logs WHERE user_id=? AND metric_id=? ORDER BY entry_date DESC LIMIT ?`).all(userId, metricId, limit));
 }
 // حدّد/عدّل قيمة يوم من الواجهة (قيمة فاضية = امسح تسجيل اليوم)
-export function setMetricDay(userId, metricId, date, value, note) {
-  const m = db.prepare(`SELECT id FROM metrics WHERE user_id=? AND id=?`).get(userId, metricId);
+export async function setMetricDay(userId, metricId, date, value, note) {
+  const m = (await db.prepare(`SELECT id FROM metrics WHERE user_id=? AND id=?`).get(userId, metricId));
   if (!m) return false;
   const d = normMetricDate(date);
-  if (value === "" || value == null) { db.prepare(`DELETE FROM metric_logs WHERE user_id=? AND metric_id=? AND entry_date=?`).run(userId, metricId, d); return true; }
+  if (value === "" || value == null) { (await db.prepare(`DELETE FROM metric_logs WHERE user_id=? AND metric_id=? AND entry_date=?`).run(userId, metricId, d)); return true; }
   const v = cleanMetricValue(value);
   if (v == null) return false; // قيمة غير صالحة
-  const ex = db.prepare(`SELECT id FROM metric_logs WHERE user_id=? AND metric_id=? AND entry_date=?`).get(userId, metricId, d);
-  if (ex) db.prepare(`UPDATE metric_logs SET value=?, note=?, created_at=? WHERE id=?`).run(v, note || null, now(), ex.id);
-  else db.prepare(`INSERT INTO metric_logs (created_at,user_id,metric_id,entry_date,value,note) VALUES (?,?,?,?,?,?)`).run(now(), userId, metricId, d, v, note || null);
+  const ex = (await db.prepare(`SELECT id FROM metric_logs WHERE user_id=? AND metric_id=? AND entry_date=?`).get(userId, metricId, d));
+  if (ex) (await db.prepare(`UPDATE metric_logs SET value=?, note=?, created_at=? WHERE id=?`).run(v, note || null, now(), ex.id));
+  else (await db.prepare(`INSERT INTO metric_logs (created_at,user_id,metric_id,entry_date,value,note) VALUES (?,?,?,?,?,?)`).run(now(), userId, metricId, d, v, note || null));
   return true;
 }
-export function updateMetricMeta(userId, id, patch) {
+export async function updateMetricMeta(userId, id, patch) {
   const sets = [], vals = [];
   for (const c of ["title", "unit", "emoji", "daily_target"]) if (patch[c] !== undefined) {
     if (c === "title" && !String(patch[c] ?? "").trim()) continue; // title NOT NULL — متسيبش العنوان يتمسح
@@ -1062,18 +1128,25 @@ export function updateMetricMeta(userId, id, patch) {
   }
   if (!sets.length) return false;
   vals.push(id, userId);
-  return db.prepare(`UPDATE metrics SET ${sets.join(", ")} WHERE id=? AND user_id=?`).run(...vals).changes > 0;
+  return (await db.prepare(`UPDATE metrics SET ${sets.join(", ")} WHERE id=? AND user_id=?`).run(...vals)).changes > 0;
 }
 // حذف المتتبِّع + كل تسجيلاته في معاملة واحدة (مايسيبش يتامى لو حصل انقطاع)
-const _deleteMetricTx = db.transaction((userId, id) => {
-  db.prepare(`DELETE FROM metric_logs WHERE user_id=? AND metric_id=?`).run(userId, id);
-  return db.prepare(`DELETE FROM metrics WHERE user_id=? AND id=?`).run(userId, id).changes > 0;
-});
-export function deleteMetric(userId, id) {
-  return _deleteMetricTx(userId, id);
+export async function deleteMetric(userId, id) {
+  const tx = db.transaction("write");
+  return await tx(async (t) => {
+    await t.execute({
+      sql: `DELETE FROM metric_logs WHERE user_id=? AND metric_id=?`,
+      args: [userId, id],
+    });
+    const res = await t.execute({
+      sql: `DELETE FROM metrics WHERE user_id=? AND id=?`,
+      args: [userId, id],
+    });
+    return res.rowsAffected > 0;
+  });
 }
-export function deleteMetricLog(userId, logId) {
-  return db.prepare(`DELETE FROM metric_logs WHERE user_id=? AND id=?`).run(userId, logId).changes > 0;
+export async function deleteMetricLog(userId, logId) {
+  return (await db.prepare(`DELETE FROM metric_logs WHERE user_id=? AND id=?`).run(userId, logId)).changes > 0;
 }
 
 /* ===================== Tasks (مهام + تقويم) ===================== */
@@ -1082,11 +1155,11 @@ const insertTaskStmt = db.prepare(`
   INSERT INTO tasks (created_at, user_id, title, due_date, due_time, note, resources)
   VALUES (?, ?, ?, ?, ?, ?, ?)
 `);
-export function addTask({ userId, title, dueDate, dueTime, note, resources }) {
+export async function addTask({ userId, title, dueDate, dueTime, note, resources }) {
   if (!title) return null;
   // due_date = "" معناها مهمة عامة (من غير يوم). undefined/null → النهاردة.
   const dd = dueDate === "" ? "" : (dueDate || today());
-  const info = insertTaskStmt.run(
+  const info = (await insertTaskStmt.run(
     now(),
     userId,
     title.trim(),
@@ -1094,60 +1167,60 @@ export function addTask({ userId, title, dueDate, dueTime, note, resources }) {
     dueTime || null,
     note || null,
     resources || null
-  );
-  return getTask(userId, Number(info.lastInsertRowid));
+  ));
+  return (await getTask(userId, Number(info.lastInsertRowid)));
 }
 
-export function getTask(userId, id) {
-  return db.prepare(`SELECT * FROM tasks WHERE user_id = ? AND id = ?`).get(userId, id) || null;
+export async function getTask(userId, id) {
+  return (await db.prepare(`SELECT * FROM tasks WHERE user_id = ? AND id = ?`).get(userId, id)) || null;
 }
 
 const listTasksStmt = db.prepare(
   `SELECT * FROM tasks WHERE user_id = ? AND due_date >= ? AND due_date <= ?
    ORDER BY due_date ASC, due_time IS NULL, due_time ASC, id ASC`
 );
-export function listTasks(userId, from, to) {
-  return listTasksStmt.all(userId, from, to);
+export async function listTasks(userId, from, to) {
+  return (await listTasksStmt.all(userId, from, to));
 }
 
-export function tasksForDate(userId, date) {
-  return listTasksStmt.all(userId, date, date);
+export async function tasksForDate(userId, date) {
+  return (await listTasksStmt.all(userId, date, date));
 }
 
 const pendingTasksStmt = db.prepare(
   `SELECT * FROM tasks WHERE user_id = ? AND status = 'pending'
    ORDER BY due_date ASC, due_time IS NULL, due_time ASC LIMIT ?`
 );
-export function pendingTasks(userId, limit = 50) {
-  return pendingTasksStmt.all(userId, limit);
+export async function pendingTasks(userId, limit = 50) {
+  return (await pendingTasksStmt.all(userId, limit));
 }
 
 // الـ agent بيقفل مهمة بالاسم أو بالـ id
-export function completeTask(userId, { id, title }) {
+export async function completeTask(userId, { id, title }) {
   let task = null;
-  if (id) task = getTask(userId, Number(id));
+  if (id) task = (await getTask(userId, Number(id)));
   if (!task && title) {
-    task = db
+    task = (await db
       .prepare(
         `SELECT * FROM tasks WHERE user_id = ? AND status = 'pending' AND title LIKE ? ORDER BY due_date ASC LIMIT 1`
       )
-      .get(userId, `%${String(title).trim()}%`);
+      .get(userId, `%${String(title).trim()}%`));
   }
   if (!task) return null;
-  db.prepare(`UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?`).run(now(), task.id);
-  return getTask(userId, task.id);
+  (await db.prepare(`UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?`).run(now(), task.id));
+  return (await getTask(userId, task.id));
 }
 
-export function reopenTask(userId, id) {
+export async function reopenTask(userId, id) {
   return (
-    db
+    (await db
       .prepare(`UPDATE tasks SET status = 'pending', completed_at = NULL WHERE user_id = ? AND id = ?`)
-      .run(userId, id).changes > 0
+      .run(userId, id)).changes > 0
   );
 }
 
-export function deleteTask(userId, id) {
-  return db.prepare(`DELETE FROM tasks WHERE user_id = ? AND id = ?`).run(userId, id).changes > 0;
+export async function deleteTask(userId, id) {
+  return (await db.prepare(`DELETE FROM tasks WHERE user_id = ? AND id = ?`).run(userId, id)).changes > 0;
 }
 
 // المهام اللي معادها دلوقتي ومحدش اتفكّر بيها — للتذكير (إشعار داخل التطبيق + موبايل)
@@ -1156,11 +1229,11 @@ const dueTasksStmt = db.prepare(`
   WHERE t.status = 'pending' AND t.reminded_at IS NULL
     AND t.due_date = ? AND t.due_time IS NOT NULL AND t.due_time <= ?
 `);
-export function dueTaskReminders(date, time) {
-  return dueTasksStmt.all(date, time);
+export async function dueTaskReminders(date, time) {
+  return (await dueTasksStmt.all(date, time));
 }
-export function markTaskReminded(id) {
-  db.prepare(`UPDATE tasks SET reminded_at = ? WHERE id = ?`).run(now(), id);
+export async function markTaskReminded(id) {
+  (await db.prepare(`UPDATE tasks SET reminded_at = ? WHERE id = ?`).run(now(), id));
 }
 
 /* ===================== Conversations (ذاكرة المحادثة) ===================== */
@@ -1169,8 +1242,8 @@ const insertConvStmt = db.prepare(`
   INSERT INTO conversations (created_at, user_id, chat_id, kind, user_text, ai_reply, meta_json)
   VALUES (?, ?, ?, ?, ?, ?, ?)
 `);
-export function logConversation({ userId, chatId, kind, userText, aiReply, meta }) {
-  const info = insertConvStmt.run(
+export async function logConversation({ userId, chatId, kind, userText, aiReply, meta }) {
+  const info = (await insertConvStmt.run(
     now(),
     userId,
     chatId != null ? String(chatId) : null,
@@ -1178,41 +1251,41 @@ export function logConversation({ userId, chatId, kind, userText, aiReply, meta 
     userText || null,
     aiReply || null,
     meta ? JSON.stringify(meta) : null
-  );
+  ));
   return Number(info.lastInsertRowid);
 }
 
 const listConvStmt = db.prepare(
   `SELECT * FROM conversations WHERE user_id = ? ORDER BY id DESC LIMIT ?`
 );
-export function listConversations(userId, limit = 500) {
-  return listConvStmt.all(userId, limit).map((r) => ({
+export async function listConversations(userId, limit = 500) {
+  return (await listConvStmt.all(userId, limit)).map((r) => ({
     ...r,
     meta: parseJson(r.meta_json, null),
   }));
 }
 
 // آخر محادثات بترتيب زمني صاعد — دي ذاكرة الـ agent القصيرة
-export function recentConversations(userId, limit = 10) {
-  return listConvStmt.all(userId, limit).reverse();
+export async function recentConversations(userId, limit = 10) {
+  return (await listConvStmt.all(userId, limit)).reverse();
 }
 
 // هل نفس المستخدم بعت نفس النص بالظبط في آخر X دقيقة؟ (منع تكرار معالجة نفس التسجيل لو اتبعت أكتر من مرة)
-export function recentIdenticalConversation(userId, text, minutes = 10) {
+export async function recentIdenticalConversation(userId, text, minutes = 10) {
   if (!text || !String(text).trim()) return null;
   const since = new Date(Date.now() - minutes * 60000).toISOString();
-  return db
+  return (await db
     .prepare(
       `SELECT id, ai_reply FROM conversations
        WHERE user_id = ? AND user_text = ? AND created_at >= ?
        ORDER BY id DESC LIMIT 1`
     )
-    .get(userId, String(text), since);
+    .get(userId, String(text), since));
 }
 
-export function deleteConversation(userId, id) {
+export async function deleteConversation(userId, id) {
   return (
-    db.prepare(`DELETE FROM conversations WHERE user_id = ? AND id = ?`).run(userId, id).changes > 0
+    (await db.prepare(`DELETE FROM conversations WHERE user_id = ? AND id = ?`).run(userId, id)).changes > 0
   );
 }
 
@@ -1233,15 +1306,15 @@ const insertConditionStmt = db.prepare(`
 `);
 
 // لو فيه متابعة شغّالة لنفس الحالة منعملش تانية — نرجّعها زي ما هي
-export function addCondition({ userId, title, startDate, durationDays = 30, note }) {
+export async function addCondition({ userId, title, startDate, durationDays = 30, note }) {
   if (!title) return null;
   const start = startDate || today();
-  const existing = findActiveConditionStmt.get(userId, `%${title.trim()}%`);
+  const existing = (await findActiveConditionStmt.get(userId, `%${title.trim()}%`));
   if (existing) {
     return { ...existing, created: false };
   }
   const end = addDays(start, durationDays);
-  const info = insertConditionStmt.run(now(), userId, title.trim(), start, end, note || null);
+  const info = (await insertConditionStmt.run(now(), userId, title.trim(), start, end, note || null));
   return {
     id: Number(info.lastInsertRowid),
     title: title.trim(),
@@ -1253,27 +1326,27 @@ export function addCondition({ userId, title, startDate, durationDays = 30, note
   };
 }
 
-export function listConditions(userId) {
-  return db
+export async function listConditions(userId) {
+  return (await db
     .prepare(`SELECT * FROM conditions WHERE user_id = ? ORDER BY status ASC, id DESC`)
-    .all(userId);
+    .all(userId));
 }
-export function activeConditions(userId) {
-  return db
+export async function activeConditions(userId) {
+  return (await db
     .prepare(`SELECT * FROM conditions WHERE user_id = ? AND status = 'active' ORDER BY id DESC`)
-    .all(userId);
+    .all(userId));
 }
-export function getCondition(userId, id) {
-  return db.prepare(`SELECT * FROM conditions WHERE user_id = ? AND id = ?`).get(userId, id);
+export async function getCondition(userId, id) {
+  return (await db.prepare(`SELECT * FROM conditions WHERE user_id = ? AND id = ?`).get(userId, id));
 }
-export function closeCondition(userId, id) {
+export async function closeCondition(userId, id) {
   return (
-    db.prepare(`UPDATE conditions SET status = 'closed' WHERE user_id = ? AND id = ?`).run(userId, id)
+    (await db.prepare(`UPDATE conditions SET status = 'closed' WHERE user_id = ? AND id = ?`).run(userId, id))
       .changes > 0
   );
 }
-export function deleteCondition(userId, id) {
-  return db.prepare(`DELETE FROM conditions WHERE user_id = ? AND id = ?`).run(userId, id).changes > 0;
+export async function deleteCondition(userId, id) {
+  return (await db.prepare(`DELETE FROM conditions WHERE user_id = ? AND id = ?`).run(userId, id)).changes > 0;
 }
 
 /* ===================== Meals (الأكل) ===================== */
@@ -1282,18 +1355,18 @@ const insertMealStmt = db.prepare(`
   INSERT INTO meals (created_at, user_id, entry_date, at_time, items, note)
   VALUES (?, ?, ?, ?, ?, ?)
 `);
-export function addMeal({ userId, entryDate, atTime, items, note }) {
-  const info = insertMealStmt.run(now(), userId, entryDate || today(), atTime || null, items, note || null);
+export async function addMeal({ userId, entryDate, atTime, items, note }) {
+  const info = (await insertMealStmt.run(now(), userId, entryDate || today(), atTime || null, items, note || null));
   return Number(info.lastInsertRowid);
 }
 
-export function listMeals(userId, limit = 500) {
-  return db
+export async function listMeals(userId, limit = 500) {
+  return (await db
     .prepare(`SELECT * FROM meals WHERE user_id = ? ORDER BY entry_date DESC, id DESC LIMIT ?`)
-    .all(userId, limit);
+    .all(userId, limit));
 }
-export function deleteMeal(userId, id) {
-  return db.prepare(`DELETE FROM meals WHERE user_id = ? AND id = ?`).run(userId, id).changes > 0;
+export async function deleteMeal(userId, id) {
+  return (await db.prepare(`DELETE FROM meals WHERE user_id = ? AND id = ?`).run(userId, id)).changes > 0;
 }
 
 /* ===================== Habits (عادات) ===================== */
@@ -1307,18 +1380,18 @@ const insertHabitStmt = db.prepare(`
 `);
 
 // لو العادة موجودة نرجّعها، لو لأ ننشئها
-export function addHabit({ userId, title, kind = "do", emoji, note }) {
+export async function addHabit({ userId, title, kind = "do", emoji, note }) {
   if (!title) return null;
-  const existing = findActiveHabitStmt.get(userId, `%${title.trim()}%`);
+  const existing = (await findActiveHabitStmt.get(userId, `%${title.trim()}%`));
   if (existing) return { ...existing, created: false };
-  const info = insertHabitStmt.run(
+  const info = (await insertHabitStmt.run(
     now(),
     userId,
     title.trim(),
     kind === "quit" ? "quit" : "do",
     emoji || null,
     note || null
-  );
+  ));
   return {
     id: Number(info.lastInsertRowid),
     title: title.trim(),
@@ -1330,24 +1403,24 @@ export function addHabit({ userId, title, kind = "do", emoji, note }) {
   };
 }
 
-export function findHabitByTitle(userId, title) {
+export async function findHabitByTitle(userId, title) {
   if (!title) return null;
-  return findActiveHabitStmt.get(userId, `%${title.trim()}%`) || null;
+  return (await findActiveHabitStmt.get(userId, `%${title.trim()}%`)) || null;
 }
 
 const insertHabitLogStmt = db.prepare(`
   INSERT OR IGNORE INTO habit_logs (created_at, habit_id, log_date)
   VALUES (?, ?, ?)
 `);
-export function logHabit(habitId, logDate) {
+export async function logHabit(habitId, logDate) {
   const date = logDate || today();
-  const info = insertHabitLogStmt.run(now(), habitId, date);
+  const info = (await insertHabitLogStmt.run(now(), habitId, date));
   return { logged: info.changes > 0, date };
 }
 
-export function unlogHabit(habitId, logDate) {
+export async function unlogHabit(habitId, logDate) {
   return (
-    db.prepare(`DELETE FROM habit_logs WHERE habit_id = ? AND log_date = ?`).run(habitId, logDate)
+    (await db.prepare(`DELETE FROM habit_logs WHERE habit_id = ? AND log_date = ?`).run(habitId, logDate))
       .changes > 0
   );
 }
@@ -1373,12 +1446,14 @@ function habitStreak(dates) {
   return streak;
 }
 
-export function listHabits(userId) {
-  return db
+export async function listHabits(userId) {
+  const rows = (await db
     .prepare(`SELECT * FROM habits WHERE user_id = ? AND status = 'active' ORDER BY id DESC`)
-    .all(userId)
-    .map((h) => {
-      const dates = habitLogsStmt.all(h.id).map((r) => r.log_date);
+    .all(userId));
+  // Promise.all لازم: map async بترجّع array of Promise، مش array من القيم
+  return Promise.all(
+    rows.map(async (h) => {
+      const dates = (await habitLogsStmt.all(h.id)).map((r) => r.log_date);
       const todayISO = today();
       return {
         ...h,
@@ -1387,18 +1462,19 @@ export function listHabits(userId) {
         streak: habitStreak(dates),
         doneToday: dates.includes(todayISO),
       };
-    });
+    })
+  );
 }
 
-export function getHabit(userId, id) {
-  return db.prepare(`SELECT * FROM habits WHERE user_id = ? AND id = ?`).get(userId, id);
+export async function getHabit(userId, id) {
+  return (await db.prepare(`SELECT * FROM habits WHERE user_id = ? AND id = ?`).get(userId, id));
 }
 
-export function deleteHabit(userId, id) {
-  const habit = getHabit(userId, id);
+export async function deleteHabit(userId, id) {
+  const habit = (await getHabit(userId, id));
   if (!habit) return false;
-  db.prepare(`DELETE FROM habit_logs WHERE habit_id = ?`).run(id);
-  return db.prepare(`DELETE FROM habits WHERE id = ?`).run(id).changes > 0;
+  (await db.prepare(`DELETE FROM habit_logs WHERE habit_id = ?`).run(id));
+  return (await db.prepare(`DELETE FROM habits WHERE id = ?`).run(id)).changes > 0;
 }
 
 /* ===================== AI usage (تكلفة OpenAI) ===================== */
@@ -1407,9 +1483,9 @@ const insertAiUsageStmt = db.prepare(`
   INSERT INTO ai_usage (created_at, user_id, usage_date, kind, model, input_tokens, output_tokens, audio_seconds, cost_usd)
   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
-export function recordAiUsage({ userId, kind, model, inputTokens = 0, outputTokens = 0, audioSeconds = 0, costUsd = 0 }) {
+export async function recordAiUsage({ userId, kind, model, inputTokens = 0, outputTokens = 0, audioSeconds = 0, costUsd = 0 }) {
   try {
-    insertAiUsageStmt.run(
+    (await insertAiUsageStmt.run(
       now(),
       userId ?? null,
       today(),
@@ -1419,7 +1495,7 @@ export function recordAiUsage({ userId, kind, model, inputTokens = 0, outputToke
       Math.round(Number(outputTokens) || 0),
       Number(audioSeconds) || 0,
       Number(costUsd) || 0
-    );
+    ));
   } catch {
     // التتبّع ماينفعش يكسر السير الأساسي
   }
@@ -1444,11 +1520,11 @@ const usageByKindStmt = db.prepare(`
   FROM ai_usage GROUP BY kind, model ORDER BY cost_usd DESC
 `);
 // تكلفة الـ AI لمستخدم واحد (إجمالي + الشهر الحالي) — يظهر له في الرئيسية
-export function userUsageCost(userId) {
+export async function userUsageCost(userId) {
   const monthStart = today().slice(0, 8) + "01";
   return {
-    total: db.prepare(`SELECT COALESCE(SUM(cost_usd),0) c FROM ai_usage WHERE user_id = ?`).get(userId).c,
-    month: db.prepare(`SELECT COALESCE(SUM(cost_usd),0) c FROM ai_usage WHERE user_id = ? AND usage_date >= ?`).get(userId, monthStart).c,
+    total: (await db.prepare(`SELECT COALESCE(SUM(cost_usd),0) c FROM ai_usage WHERE user_id = ?`).get(userId)).c,
+    month: (await db.prepare(`SELECT COALESCE(SUM(cost_usd),0) c FROM ai_usage WHERE user_id = ? AND usage_date >= ?`).get(userId, monthStart)).c,
   };
 }
 const usageDailyStmt = db.prepare(`
@@ -1462,41 +1538,41 @@ const usageMonthStmt = db.prepare(`
   FROM ai_usage WHERE usage_date >= ?
 `);
 
-export function aiUsageSummary(days = 30) {
-  const totals = usageTotalsStmt.get();
+export async function aiUsageSummary(days = 30) {
+  const totals = (await usageTotalsStmt.get());
   const since = new Date(Date.now() - (Number(days) - 1) * 86400000)
     .toISOString()
     .slice(0, 10);
   const monthStart = today().slice(0, 8) + "01";
-  const month = usageMonthStmt.get(monthStart);
+  const month = (await usageMonthStmt.get(monthStart));
   return {
     totals,
     month,
-    byKind: usageByKindStmt.all(),
-    daily: usageDailyStmt.all(since),
+    byKind: (await usageByKindStmt.all()),
+    daily: (await usageDailyStmt.all(since)),
   };
 }
 
 // تفاصيل تكلفة الـ AI لمستخدم واحد (للعرض في حسابه — مش admin)
-export function userUsageDetails(userId) {
+export async function userUsageDetails(userId) {
   const monthStart = today().slice(0, 8) + "01";
-  const totals = db.prepare(`
+  const totals = (await db.prepare(`
     SELECT COUNT(*) calls,
            COALESCE(SUM(input_tokens),0) input_tokens,
            COALESCE(SUM(output_tokens),0) output_tokens,
            COALESCE(SUM(audio_seconds),0) audio_seconds,
            COALESCE(SUM(cost_usd),0) cost_usd,
            MIN(usage_date) since
-    FROM ai_usage WHERE user_id = ?`).get(userId);
-  const month = db.prepare(`SELECT COALESCE(SUM(cost_usd),0) cost_usd, COUNT(*) calls FROM ai_usage WHERE user_id = ? AND usage_date >= ?`).get(userId, monthStart);
-  const byKind = db.prepare(`
+    FROM ai_usage WHERE user_id = ?`).get(userId));
+  const month = (await db.prepare(`SELECT COALESCE(SUM(cost_usd),0) cost_usd, COUNT(*) calls FROM ai_usage WHERE user_id = ? AND usage_date >= ?`).get(userId, monthStart));
+  const byKind = (await db.prepare(`
     SELECT kind,
            COUNT(*) calls,
            COALESCE(SUM(input_tokens),0) input_tokens,
            COALESCE(SUM(output_tokens),0) output_tokens,
            COALESCE(SUM(audio_seconds),0) audio_seconds,
            COALESCE(SUM(cost_usd),0) cost_usd
-    FROM ai_usage WHERE user_id = ? GROUP BY kind ORDER BY cost_usd DESC`).all(userId);
+    FROM ai_usage WHERE user_id = ? GROUP BY kind ORDER BY cost_usd DESC`).all(userId));
   return { totals, month, byKind };
 }
 
@@ -1507,20 +1583,20 @@ const upsertPushStmt = db.prepare(`
   VALUES (?, ?, ?, ?, ?)
   ON CONFLICT(endpoint) DO UPDATE SET user_id = excluded.user_id, p256dh = excluded.p256dh, auth = excluded.auth
 `);
-export function savePushSubscription(userId, sub) {
+export async function savePushSubscription(userId, sub) {
   if (!userId || !sub?.endpoint || !sub?.keys?.p256dh || !sub?.keys?.auth) return false;
-  upsertPushStmt.run(now(), userId, sub.endpoint, sub.keys.p256dh, sub.keys.auth);
+  (await upsertPushStmt.run(now(), userId, sub.endpoint, sub.keys.p256dh, sub.keys.auth));
   return true;
 }
 
 const listPushByUserStmt = db.prepare(`SELECT * FROM push_subscriptions WHERE user_id = ?`);
-export function listPushSubscriptions(userId) {
-  return listPushByUserStmt.all(userId);
+export async function listPushSubscriptions(userId) {
+  return (await listPushByUserStmt.all(userId));
 }
 
 const deletePushStmt = db.prepare(`DELETE FROM push_subscriptions WHERE endpoint = ?`);
-export function deletePushSubscription(endpoint) {
-  if (endpoint) deletePushStmt.run(endpoint);
+export async function deletePushSubscription(endpoint) {
+  if (endpoint) (await deletePushStmt.run(endpoint));
 }
 
 /* ===================== In-app notifications (الجرس) ===================== */
@@ -1529,9 +1605,9 @@ const insertNotifStmt = db.prepare(`
   INSERT INTO notifications (created_at, user_id, title, body, url, icon)
   VALUES (?, ?, ?, ?, ?, ?)
 `);
-export function addNotification(userId, { title, body = "", url = "/", icon = "🔔" } = {}) {
+export async function addNotification(userId, { title, body = "", url = "/", icon = "🔔" } = {}) {
   if (!userId || !title) return null;
-  const info = insertNotifStmt.run(now(), userId, title, body, url, icon);
+  const info = (await insertNotifStmt.run(now(), userId, title, body, url, icon));
   return Number(info.lastInsertRowid);
 }
 
@@ -1539,15 +1615,15 @@ const listNotifStmt = db.prepare(`
   SELECT id, created_at, title, body, url, icon, read_at
   FROM notifications WHERE user_id = ? ORDER BY id DESC LIMIT ?
 `);
-export function listNotifications(userId, limit = 30) {
-  return listNotifStmt.all(userId, limit);
+export async function listNotifications(userId, limit = 30) {
+  return (await listNotifStmt.all(userId, limit));
 }
 
 const unreadCountStmt = db.prepare(
   `SELECT COUNT(*) AS c FROM notifications WHERE user_id = ? AND read_at IS NULL`
 );
-export function unreadNotificationCount(userId) {
-  return unreadCountStmt.get(userId).c;
+export async function unreadNotificationCount(userId) {
+  return (await unreadCountStmt.get(userId)).c;
 }
 
 const markAllReadStmt = db.prepare(
@@ -1556,9 +1632,9 @@ const markAllReadStmt = db.prepare(
 const markOneReadStmt = db.prepare(
   `UPDATE notifications SET read_at = ? WHERE user_id = ? AND id = ? AND read_at IS NULL`
 );
-export function markNotificationsRead(userId, id = null) {
-  if (id) markOneReadStmt.run(now(), userId, id);
-  else markAllReadStmt.run(now(), userId);
+export async function markNotificationsRead(userId, id = null) {
+  if (id) (await markOneReadStmt.run(now(), userId, id));
+  else (await markAllReadStmt.run(now(), userId));
 }
 
 /* ===================== Profile facts (ذاكرة دائمة عن الشخص) ===================== */
@@ -1575,28 +1651,28 @@ const upsertProfileFactStmt = db.prepare(`
 `);
 
 // بيضيف معلومة دائمة أو بيحدّثها لو المفتاح موجود (مثلاً "الوزن" بيتحدّث مش بيتكرر)
-export function upsertProfileFact({ userId, category, key, value }) {
+export async function upsertProfileFact({ userId, category, key, value }) {
   if (!key || !value) return null;
   const cat = PROFILE_CATEGORIES.includes(category) ? category : "أخرى";
   const k = String(key).trim();
-  const existed = db.prepare(`SELECT id FROM profile_facts WHERE user_id = ? AND fact_key = ?`).get(userId, k);
-  upsertProfileFactStmt.run(now(), now(), userId, cat, k, String(value).trim());
+  const existed = (await db.prepare(`SELECT id FROM profile_facts WHERE user_id = ? AND fact_key = ?`).get(userId, k));
+  (await upsertProfileFactStmt.run(now(), now(), userId, cat, k, String(value).trim()));
   return { key: k, value: String(value).trim(), category: cat, created: !existed };
 }
 
-export function listProfileFacts(userId) {
-  return db
+export async function listProfileFacts(userId) {
+  return (await db
     .prepare(`SELECT * FROM profile_facts WHERE user_id = ? ORDER BY category, id`)
-    .all(userId);
+    .all(userId));
 }
 
-export function deleteProfileFact(userId, id) {
-  return db.prepare(`DELETE FROM profile_facts WHERE user_id = ? AND id = ?`).run(userId, id).changes > 0;
+export async function deleteProfileFact(userId, id) {
+  return (await db.prepare(`DELETE FROM profile_facts WHERE user_id = ? AND id = ?`).run(userId, id)).changes > 0;
 }
 
 // نسخة مختصرة للـ agent: { category: ["key: value", ...] }
-export function profileForAgent(userId) {
-  const rows = listProfileFacts(userId);
+export async function profileForAgent(userId) {
+  const rows = (await listProfileFacts(userId));
   const out = {};
   for (const r of rows) {
     (out[r.category] = out[r.category] || []).push(`${r.fact_key}: ${r.value}`);
@@ -1614,48 +1690,48 @@ const insertIdeaStmt = db.prepare(
 const activeIdeasForDupStmt = db.prepare(
   `SELECT id, title FROM ideas WHERE user_id = ? AND status != 'done' ORDER BY id DESC LIMIT 200`
 );
-export function addIdea({ userId, title, detail, status }) {
+export async function addIdea({ userId, title, detail, status }) {
   if (!title) return null;
   const t = String(title).trim();
   const nn = normNote(t);
   // مانكرّرش فكرة نشطة موجودة بنفس العنوان (بعد تطبيع) — حتى لو اتقالت في يوم تاني.
-  const dup = activeIdeasForDupStmt.all(userId).find((i) => normNote(i.title) === nn);
-  if (dup) return db.prepare(`SELECT * FROM ideas WHERE id = ?`).get(dup.id);
+  const dup = (await activeIdeasForDupStmt.all(userId)).find((i) => normNote(i.title) === nn);
+  if (dup) return (await db.prepare(`SELECT * FROM ideas WHERE id = ?`).get(dup.id));
   const st = ["inbox", "planned", "done"].includes(status) ? status : "inbox";
-  const info = insertIdeaStmt.run(now(), userId, t, detail || null, st);
-  return db.prepare(`SELECT * FROM ideas WHERE id = ?`).get(Number(info.lastInsertRowid));
+  const info = (await insertIdeaStmt.run(now(), userId, t, detail || null, st));
+  return (await db.prepare(`SELECT * FROM ideas WHERE id = ?`).get(Number(info.lastInsertRowid)));
 }
-export function listIdeas(userId, limit = 200) {
-  return db
+export async function listIdeas(userId, limit = 200) {
+  return (await db
     .prepare(`SELECT * FROM ideas WHERE user_id = ? ORDER BY status = 'done', id DESC LIMIT ?`)
-    .all(userId, limit);
+    .all(userId, limit));
 }
-export function setIdeaStatus(userId, id, status) {
+export async function setIdeaStatus(userId, id, status) {
   if (!["inbox", "planned", "done"].includes(status)) return false;
-  return db.prepare(`UPDATE ideas SET status = ? WHERE user_id = ? AND id = ?`).run(status, userId, id).changes > 0;
+  return (await db.prepare(`UPDATE ideas SET status = ? WHERE user_id = ? AND id = ?`).run(status, userId, id)).changes > 0;
 }
-export function deleteIdea(userId, id) {
-  return db.prepare(`DELETE FROM ideas WHERE user_id = ? AND id = ?`).run(userId, id).changes > 0;
+export async function deleteIdea(userId, id) {
+  return (await db.prepare(`DELETE FROM ideas WHERE user_id = ? AND id = ?`).run(userId, id)).changes > 0;
 }
 
 /* ===== خواطر / عصف ذهني — كلام حُرّ خام (مش بيتفكّك) ===== */
-export function addThought(userId, text, kind = "text") {
+export async function addThought(userId, text, kind = "text") {
   const t = String(text || "").trim();
   if (!t) return null;
-  const info = db.prepare(`INSERT INTO thoughts (created_at, user_id, text, kind) VALUES (?, ?, ?, ?)`).run(now(), userId, t, kind);
-  return db.prepare(`SELECT id, created_at, text, kind FROM thoughts WHERE id = ?`).get(Number(info.lastInsertRowid));
+  const info = (await db.prepare(`INSERT INTO thoughts (created_at, user_id, text, kind) VALUES (?, ?, ?, ?)`).run(now(), userId, t, kind));
+  return (await db.prepare(`SELECT id, created_at, text, kind FROM thoughts WHERE id = ?`).get(Number(info.lastInsertRowid)));
 }
-export function listThoughts(userId, limit = 200) {
-  return db.prepare(`SELECT id, created_at, text, kind FROM thoughts WHERE user_id = ? ORDER BY id DESC LIMIT ?`).all(userId, limit);
+export async function listThoughts(userId, limit = 200) {
+  return (await db.prepare(`SELECT id, created_at, text, kind FROM thoughts WHERE user_id = ? ORDER BY id DESC LIMIT ?`).all(userId, limit));
 }
-export function deleteThought(userId, id) {
-  return db.prepare(`DELETE FROM thoughts WHERE user_id = ? AND id = ?`).run(userId, id).changes > 0;
+export async function deleteThought(userId, id) {
+  return (await db.prepare(`DELETE FROM thoughts WHERE user_id = ? AND id = ?`).run(userId, id)).changes > 0;
 }
 // لقطة مختصرة للـ agent عشان مايكرّرش نفس الفكرة
-export function recentIdeas(userId, limit = 12) {
-  return db
+export async function recentIdeas(userId, limit = 12) {
+  return (await db
     .prepare(`SELECT title, status FROM ideas WHERE user_id = ? ORDER BY id DESC LIMIT ?`)
-    .all(userId, limit);
+    .all(userId, limit));
 }
 
 /* ===================== Problems (المشاكل والهموم — قلبك) ===================== */
@@ -1669,49 +1745,49 @@ const insertProblemStmt = db.prepare(
   `INSERT INTO problems (created_at, updated_at, user_id, title, detail, area, status) VALUES (?, ?, ?, ?, ?, ?, 'active')`
 );
 // لو مشكلة شبه موجودة ونشطة، نرجّعها بدل ما نكرّرها
-export function addProblem({ userId, title, detail, area }) {
+export async function addProblem({ userId, title, detail, area }) {
   if (!title) return null;
   const t = String(title).trim();
-  const existing = findActiveProblemStmt.get(userId, `%${t}%`);
+  const existing = (await findActiveProblemStmt.get(userId, `%${t}%`));
   if (existing) return { ...existing, created: false };
   const ar = PROBLEM_AREAS.includes(area) ? area : "أخرى";
-  const info = insertProblemStmt.run(now(), now(), userId, t, detail || null, ar);
-  return { ...db.prepare(`SELECT * FROM problems WHERE id = ?`).get(Number(info.lastInsertRowid)), created: true };
+  const info = (await insertProblemStmt.run(now(), now(), userId, t, detail || null, ar));
+  return { ...(await db.prepare(`SELECT * FROM problems WHERE id = ?`).get(Number(info.lastInsertRowid))), created: true };
 }
-export function listProblems(userId, limit = 200) {
-  return db
+export async function listProblems(userId, limit = 200) {
+  return (await db
     .prepare(
       `SELECT * FROM problems WHERE user_id = ?
        ORDER BY status = 'resolved', CASE status WHEN 'working' THEN 0 WHEN 'active' THEN 1 ELSE 2 END, id DESC
        LIMIT ?`
     )
-    .all(userId, limit);
+    .all(userId, limit));
 }
-export function activeProblems(userId) {
-  return db
+export async function activeProblems(userId) {
+  return (await db
     .prepare(`SELECT * FROM problems WHERE user_id = ? AND status != 'resolved' ORDER BY id DESC`)
-    .all(userId);
+    .all(userId));
 }
-export function setProblemStatus(userId, id, status, note) {
+export async function setProblemStatus(userId, id, status, note) {
   if (!["active", "working", "resolved"].includes(status)) return false;
   const resolvedAt = status === "resolved" ? now() : null;
   return (
-    db
+    (await db
       .prepare(`UPDATE problems SET status = ?, resolved_at = ?, note = COALESCE(?, note), updated_at = ? WHERE user_id = ? AND id = ?`)
-      .run(status, resolvedAt, note ?? null, now(), userId, id).changes > 0
+      .run(status, resolvedAt, note ?? null, now(), userId, id)).changes > 0
   );
 }
 // الـ agent بيقفل/يحدّث مشكلة بالاسم أو الـ id
-export function resolveProblem(userId, { id, title }) {
+export async function resolveProblem(userId, { id, title }) {
   let prob = null;
-  if (id) prob = db.prepare(`SELECT * FROM problems WHERE user_id = ? AND id = ?`).get(userId, Number(id));
-  if (!prob && title) prob = findActiveProblemStmt.get(userId, `%${String(title).trim()}%`);
+  if (id) prob = (await db.prepare(`SELECT * FROM problems WHERE user_id = ? AND id = ?`).get(userId, Number(id)));
+  if (!prob && title) prob = (await findActiveProblemStmt.get(userId, `%${String(title).trim()}%`));
   if (!prob) return null;
-  setProblemStatus(userId, prob.id, "resolved");
-  return db.prepare(`SELECT * FROM problems WHERE id = ?`).get(prob.id);
+  (await setProblemStatus(userId, prob.id, "resolved"));
+  return (await db.prepare(`SELECT * FROM problems WHERE id = ?`).get(prob.id));
 }
-export function deleteProblem(userId, id) {
-  return db.prepare(`DELETE FROM problems WHERE user_id = ? AND id = ?`).run(userId, id).changes > 0;
+export async function deleteProblem(userId, id) {
+  return (await db.prepare(`DELETE FROM problems WHERE user_id = ? AND id = ?`).run(userId, id)).changes > 0;
 }
 
 /* ===================== Files (مركز الملفات) ===================== */
@@ -1722,25 +1798,25 @@ const insertFileStmt = db.prepare(
   `INSERT INTO files (created_at, user_id, filename, mime, size, category, description, path)
    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
 );
-export function addFile({ userId, filename, mime, size, category, description, path }) {
+export async function addFile({ userId, filename, mime, size, category, description, path }) {
   const cat = FILE_CATEGORIES.includes(category) ? category : "أخرى";
-  const info = insertFileStmt.run(now(), userId, filename, mime || null, Number(size) || 0, cat, description || null, path);
-  return db.prepare(`SELECT * FROM files WHERE id = ?`).get(Number(info.lastInsertRowid));
+  const info = (await insertFileStmt.run(now(), userId, filename, mime || null, Number(size) || 0, cat, description || null, path));
+  return (await db.prepare(`SELECT * FROM files WHERE id = ?`).get(Number(info.lastInsertRowid)));
 }
-export function listFiles(userId, limit = 300) {
-  return db.prepare(`SELECT * FROM files WHERE user_id = ? ORDER BY id DESC LIMIT ?`).all(userId, limit);
+export async function listFiles(userId, limit = 300) {
+  return (await db.prepare(`SELECT * FROM files WHERE user_id = ? ORDER BY id DESC LIMIT ?`).all(userId, limit));
 }
-export function getFile(userId, id) {
-  return db.prepare(`SELECT * FROM files WHERE user_id = ? AND id = ?`).get(userId, id) || null;
+export async function getFile(userId, id) {
+  return (await db.prepare(`SELECT * FROM files WHERE user_id = ? AND id = ?`).get(userId, id)) || null;
 }
-export function deleteFile(userId, id) {
-  return db.prepare(`DELETE FROM files WHERE user_id = ? AND id = ?`).run(userId, id).changes > 0;
+export async function deleteFile(userId, id) {
+  return (await db.prepare(`DELETE FROM files WHERE user_id = ? AND id = ?`).run(userId, id)).changes > 0;
 }
 
 /* ===================== ميزانية وهدف الشهر (الفلوس) ===================== */
 
-export function getFinanceBudget(userId, month) {
-  const row = db.prepare(`SELECT month, budget, goal FROM finance_budget WHERE user_id = ? AND month = ?`).get(userId, month);
+export async function getFinanceBudget(userId, month) {
+  const row = (await db.prepare(`SELECT month, budget, goal FROM finance_budget WHERE user_id = ? AND month = ?`).get(userId, month));
   return row || { month, budget: null, goal: null };
 }
 const upsertBudgetStmt = db.prepare(`
@@ -1748,28 +1824,28 @@ const upsertBudgetStmt = db.prepare(`
   VALUES (?, ?, ?, ?, ?)
   ON CONFLICT(user_id, month) DO UPDATE SET budget = excluded.budget, goal = excluded.goal, updated_at = excluded.updated_at
 `);
-export function setFinanceBudget(userId, month, { budget, goal }) {
+export async function setFinanceBudget(userId, month, { budget, goal }) {
   const b = budget === "" || budget == null ? null : Number(budget);
   const g = goal === "" || goal == null ? null : Number(goal);
-  upsertBudgetStmt.run(userId, month, b, g, now());
-  return getFinanceBudget(userId, month);
+  (await upsertBudgetStmt.run(userId, month, b, g, now()));
+  return (await getFinanceBudget(userId, month));
 }
 
 /* ===================== محادثة اسأل دوّنلي (محفوظة) ===================== */
 
 const insertAskStmt = db.prepare(`INSERT INTO ask_messages (created_at, user_id, role, content) VALUES (?, ?, ?, ?)`);
-export function addAskMessage(userId, role, content) {
+export async function addAskMessage(userId, role, content) {
   if (!content) return;
-  insertAskStmt.run(now(), userId, role === "assistant" ? "assistant" : "user", String(content));
+  (await insertAskStmt.run(now(), userId, role === "assistant" ? "assistant" : "user", String(content)));
 }
-export function listAskMessages(userId, limit = 200) {
-  return db
+export async function listAskMessages(userId, limit = 200) {
+  return (await db
     .prepare(`SELECT role, content FROM ask_messages WHERE user_id = ? ORDER BY id DESC LIMIT ?`)
-    .all(userId, limit)
+    .all(userId, limit))
     .reverse();
 }
-export function clearAskMessages(userId) {
-  return db.prepare(`DELETE FROM ask_messages WHERE user_id = ?`).run(userId).changes;
+export async function clearAskMessages(userId) {
+  return (await db.prepare(`DELETE FROM ask_messages WHERE user_id = ?`).run(userId)).changes;
 }
 
 /* ===================== الأصول (دهب / كاش / أصول تانية) ===================== */
@@ -1797,12 +1873,12 @@ const insertAssetStmt = db.prepare(`
   INSERT INTO assets (created_at, updated_at, user_id, type, name, quantity, karat, currency, manual_value, goal, note, items)
   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
-export function addAsset({ userId, type, name, quantity, karat, currency, manualValue, goal, note, items }) {
+export async function addAsset({ userId, type, name, quantity, karat, currency, manualValue, goal, note, items }) {
   const t = ASSET_TYPES.includes(type) ? type : "other";
   const itemsJson = t === "gold" ? normItems(items) : null;
   let qty = quantity == null || quantity === "" ? null : Number(quantity);
   if (itemsJson) qty = goldGramsFromItems(itemsJson); // الكمية من البنود
-  const info = insertAssetStmt.run(
+  const info = (await insertAssetStmt.run(
     now(), now(), userId, t, name || null,
     qty,
     karat == null || karat === "" ? null : Number(karat),
@@ -1811,19 +1887,19 @@ export function addAsset({ userId, type, name, quantity, karat, currency, manual
     goal == null || goal === "" ? null : Number(goal),
     note || null,
     itemsJson
-  );
-  return getAsset(Number(info.lastInsertRowid));
+  ));
+  return (await getAsset(Number(info.lastInsertRowid)));
 }
-function getAsset(id) {
-  const a = db.prepare(`SELECT * FROM assets WHERE id = ?`).get(id);
+async function getAsset(id) {
+  const a = (await db.prepare(`SELECT * FROM assets WHERE id = ?`).get(id));
   if (a && a.items) { try { a.items = JSON.parse(a.items); } catch { a.items = null; } }
   return a;
 }
-export function listAssets(userId) {
-  return db.prepare(`SELECT * FROM assets WHERE user_id = ? ORDER BY type, id DESC`).all(userId)
+export async function listAssets(userId) {
+  return (await db.prepare(`SELECT * FROM assets WHERE user_id = ? ORDER BY type, id DESC`).all(userId))
     .map((a) => { if (a.items) { try { a.items = JSON.parse(a.items); } catch { a.items = null; } } return a; });
 }
-export function updateAsset(userId, id, patch) {
+export async function updateAsset(userId, id, patch) {
   const p = { ...patch, updated_at: now() };
   for (const k of ["quantity", "karat", "manual_value", "goal"]) {
     if (p[k] !== undefined) p[k] = p[k] === "" || p[k] == null ? null : Number(p[k]);
@@ -1837,15 +1913,15 @@ export function updateAsset(userId, id, patch) {
   for (const c of cols) if (p[c] !== undefined) { sets.push(`${c} = ?`); vals.push(p[c]); }
   if (!sets.length) return false;
   vals.push(Number(userId), Number(id));
-  return db.prepare(`UPDATE assets SET ${sets.join(", ")} WHERE user_id = ? AND id = ?`).run(...vals).changes > 0;
+  return (await db.prepare(`UPDATE assets SET ${sets.join(", ")} WHERE user_id = ? AND id = ?`).run(...vals)).changes > 0;
 }
-export function deleteAsset(userId, id) {
-  return db.prepare(`DELETE FROM assets WHERE user_id = ? AND id = ?`).run(userId, id).changes > 0;
+export async function deleteAsset(userId, id) {
+  return (await db.prepare(`DELETE FROM assets WHERE user_id = ? AND id = ?`).run(userId, id)).changes > 0;
 }
 
 /* أسعار السوق (دهب/جرام عيار ٢٤ + أسعار العملات) — صف واحد مشترك */
-export function getAssetMarket() {
-  const row = db.prepare(`SELECT data, updated_at FROM asset_market WHERE id = 1`).get();
+export async function getAssetMarket() {
+  const row = (await db.prepare(`SELECT data, updated_at FROM asset_market WHERE id = 1`).get());
   if (!row) return { goldG24Egp: null, rates: {}, updatedAt: null };
   try {
     const d = JSON.parse(row.data || "{}");
@@ -1854,18 +1930,18 @@ export function getAssetMarket() {
     return { goldG24Egp: null, rates: {}, updatedAt: row.updated_at };
   }
 }
-export function setAssetMarket({ goldG24Egp, rates }) {
+export async function setAssetMarket({ goldG24Egp, rates }) {
   const data = JSON.stringify({ goldG24Egp: goldG24Egp ?? null, rates: rates || {} });
-  db.prepare(`
+  (await db.prepare(`
     INSERT INTO asset_market (id, data, updated_at) VALUES (1, ?, ?)
     ON CONFLICT(id) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at
-  `).run(data, now());
-  return getAssetMarket();
+  `).run(data, now()));
+  return (await getAssetMarket());
 }
 
 /* ===================== تعديل عام لأي صف (مرونة التعديل) ===================== */
 // بنحدّث الأعمدة المسموح بيها بس (allowlist ثابت — مفيش حقن SQL) لصف يخص المستخدم.
-function updateOwned(table, allowedCols, userId, id, patch) {
+async function updateOwned(table, allowedCols, userId, id, patch) {
   const sets = [];
   const vals = [];
   for (const col of allowedCols) {
@@ -1876,38 +1952,38 @@ function updateOwned(table, allowedCols, userId, id, patch) {
   }
   if (!sets.length) return false;
   vals.push(Number(userId), Number(id));
-  return db.prepare(`UPDATE ${table} SET ${sets.join(", ")} WHERE user_id = ? AND id = ?`).run(...vals).changes > 0;
+  return (await db.prepare(`UPDATE ${table} SET ${sets.join(", ")} WHERE user_id = ? AND id = ?`).run(...vals)).changes > 0;
 }
 
-export function updateFinance(userId, id, patch) {
+export async function updateFinance(userId, id, patch) {
   const p = { ...patch };
   if (p.amount !== undefined) p.amount = Number(p.amount) || 0;
   if (p.direction !== undefined) p.direction = p.direction === "income" ? "income" : "expense";
   if (p.category !== undefined && !FINANCE_CATEGORIES.includes(p.category)) p.category = p.category || "أخرى";
-  return updateOwned("finance", ["entry_date", "direction", "amount", "category", "note"], userId, id, p);
+  return (await updateOwned("finance", ["entry_date", "direction", "amount", "category", "note"], userId, id, p));
 }
-export function updateHealth(userId, id, patch) {
-  return updateOwned("health", ["entry_date", "category", "detail", "body_region"], userId, id, patch);
+export async function updateHealth(userId, id, patch) {
+  return (await updateOwned("health", ["entry_date", "category", "detail", "body_region"], userId, id, patch));
 }
-export function updateEntry(userId, id, patch) {
-  return updateOwned("entries", ["entry_date", "mood", "summary"], userId, id, patch);
+export async function updateEntry(userId, id, patch) {
+  return (await updateOwned("entries", ["entry_date", "mood", "summary"], userId, id, patch));
 }
-export function updateTaskFields(userId, id, patch) {
+export async function updateTaskFields(userId, id, patch) {
   const p = { ...patch };
   if (p.due_time === "") p.due_time = null;
-  return updateOwned("tasks", ["title", "due_date", "due_time", "note", "resources"], userId, id, p);
+  return (await updateOwned("tasks", ["title", "due_date", "due_time", "note", "resources"], userId, id, p));
 }
-export function updateMeal(userId, id, patch) {
-  return updateOwned("meals", ["entry_date", "at_time", "items", "note"], userId, id, patch);
+export async function updateMeal(userId, id, patch) {
+  return (await updateOwned("meals", ["entry_date", "at_time", "items", "note"], userId, id, patch));
 }
-export function updateGoalMeta(userId, id, patch) {
+export async function updateGoalMeta(userId, id, patch) {
   const p = { ...patch, updated_at: now() };
   if (p.target !== undefined) p.target = p.target === "" || p.target == null ? null : Number(p.target);
   // ضبط الفترة/الـ deadline: أسبوعي/شهري = يتحسب لوحده، بتاريخ = زي ما اتبعت، مستمر = بلا نهاية
   if (p.period !== undefined) {
     p.period = p.period || null;
     if (p.period === "week" || p.period === "month") {
-      const g = db.prepare(`SELECT created_at FROM goals WHERE user_id = ? AND id = ?`).get(userId, id);
+      const g = (await db.prepare(`SELECT created_at FROM goals WHERE user_id = ? AND id = ?`).get(userId, id));
       p.deadline = computeDeadline(p.period, null, g?.created_at?.slice(0, 10));
     } else if (p.period === null) {
       p.deadline = null; // مستمر
@@ -1915,20 +1991,20 @@ export function updateGoalMeta(userId, id, patch) {
     // period === "date" → نسيب p.deadline اللي جه من الفورم
   }
   if (p.deadline !== undefined) p.deadline = p.deadline ? String(p.deadline).slice(0, 10) : null;
-  return updateOwned("goals", ["title", "target", "unit", "resources", "period", "deadline", "updated_at"], userId, id, p);
+  return (await updateOwned("goals", ["title", "target", "unit", "resources", "period", "deadline", "updated_at"], userId, id, p));
 }
-export function updateIdeaFields(userId, id, patch) {
-  return updateOwned("ideas", ["title", "detail"], userId, id, patch);
+export async function updateIdeaFields(userId, id, patch) {
+  return (await updateOwned("ideas", ["title", "detail"], userId, id, patch));
 }
-export function updateProblemFields(userId, id, patch) {
+export async function updateProblemFields(userId, id, patch) {
   const p = { ...patch, updated_at: now() };
   if (p.area !== undefined && !PROBLEM_AREAS.includes(p.area)) p.area = "أخرى";
-  return updateOwned("problems", ["title", "detail", "area", "updated_at"], userId, id, p);
+  return (await updateOwned("problems", ["title", "detail", "area", "updated_at"], userId, id, p));
 }
-export function updateHabitFields(userId, id, patch) {
+export async function updateHabitFields(userId, id, patch) {
   const p = { ...patch };
   if (p.kind !== undefined) p.kind = p.kind === "quit" ? "quit" : "do";
-  return updateOwned("habits", ["title", "kind", "emoji"], userId, id, p);
+  return (await updateOwned("habits", ["title", "kind", "emoji"], userId, id, p));
 }
 
 /* ===================== helpers ===================== */
