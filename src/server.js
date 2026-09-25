@@ -1271,9 +1271,24 @@ export async function createApp() {
     const { entryDate, direction, amount, currency, category, note } = req.body || {};
     if (amount == null || amount === "" || isNaN(Number(amount)))
       return res.status(400).json({ error: "المبلغ مطلوب" });
+    // التاريخ اختياري: فاضي/مش موجود = النهارده. أي قيمة تانية لازم تكون
+    // YYYY-MM-DD حقيقية، ومش أبعد من النهارده (ما نسجّلش عمليات مستقبلية).
+    const todayStr = localToday();
+    let eDate = todayStr;
+    if (entryDate != null && entryDate !== "") {
+      const s = String(entryDate);
+      // Date.parse بيعدّي 2026-02-31 لـ 2026-03-03 من غير ما يبقى NaN، فبنتحقق
+      // إن الرجوع لنفس النص (يعني التاريخ موجود فعلًا مش متسرّب).
+      const parsed = /^\d{4}-\d{2}-\d{2}$/.test(s) ? new Date(`${s}T00:00:00Z`) : null;
+      if (!parsed || isNaN(parsed) || parsed.toISOString().slice(0, 10) !== s)
+        return res.status(400).json({ error: "تاريخ غير صحيح" });
+      if (s > todayStr)
+        return res.status(400).json({ error: "التاريخ لا يمكن أن يكون في المستقبل" });
+      eDate = s;
+    }
     const id = (await addFinance({
       userId: user.id,
-      entryDate: entryDate || localToday(),
+      entryDate: eDate,
       direction,
       amount,
       currency,

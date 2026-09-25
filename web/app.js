@@ -29,7 +29,12 @@ const state = {
 };
 
 const $ = (id) => document.getElementById(id);
-const TODAY = () => new Date().toISOString().slice(0, 10);
+// تاريخ النهارده بالتوقيت المحلي للجهاز. toISOString() بيرجع UTC، فكان بيدي
+// بكرة-1 لن صبح 12 بالليل في مصر (UTC+2/+3). بنركّب التاريخ من أجزاء محلية.
+const TODAY = () => {
+  const n = new Date();
+  return `${n.getFullYear()}-${String(n.getMonth() + 1).padStart(2, "0")}-${String(n.getDate()).padStart(2, "0")}`;
+};
 
 /* ===================== Helpers ===================== */
 // أرقام هندية زي التصميم: ٧.٢ ، ١٬٨٠٠
@@ -1998,20 +2003,29 @@ $("budgetForm")?.addEventListener("submit", async (e) => {
   } catch {}
   renderBudget();
 });
+// تاريخ العملية: النهارده افتراضيًا، ينفع يتغيّر لأي يوم سابق.
+// reset() بيرجّع الحقول لقيمتها في الـ HTML، فبنحط التاريخ يدوي بعده.
+function resetFinDate() {
+  const el = $("finDate");
+  if (el) { el.max = TODAY(); el.value = TODAY(); }
+}
 $("finForm").addEventListener("submit", async (e) => {
   e.preventDefault();
   const direction = $("finDir").value;
   const amount = $("finAmount").value;
+  const entryDate = $("finDate")?.value || TODAY();
   const category = $("finCategory").value;
   const currency = $("finCurrency")?.value || "جنيه";
   const note = $("finNote").value.trim();
   if (amount === "") return;
-  await api("/api/finance", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ direction, amount, category, currency, note }) });
+  await api("/api/finance", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ entryDate, direction, amount, category, currency, note }) });
   e.target.reset();
+  resetFinDate();
   fillCategorySelect();
   await loadAll(false);
   renderFinancesPage();
 });
+resetFinDate();
 function fillCategorySelect() {
   const sel = $("finCategory");
   if (!sel || !state.categories.length) return;

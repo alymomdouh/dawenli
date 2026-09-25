@@ -1141,6 +1141,21 @@ select.field { cursor: pointer; }
 .inline-form { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
 .inline-form .grow { flex: 1; min-width: 140px; }
 
+/* حقل التاريخ: نايتف，免得 نبني تقويم من الصفر. بيتقيّد بـ max = النهارده
+   فميقدرش يسجّل عملية مستقبلية، وبيقبل أي يوم قديم. */
+input[type="date"].field {
+  width: 148px;
+  color-scheme: light;
+  font-family: var(--font-body);
+}
+input[type="date"].field::-webkit-calendar-picker-indicator {
+  cursor: pointer;
+  opacity: 0.5;
+  transition: opacity var(--dur-fast) var(--ease-soft);
+}
+input[type="date"].field::-webkit-calendar-picker-indicator:hover { opacity: 1; }
+input[type="date"].field:focus::-webkit-calendar-picker-indicator { opacity: 0.9; }
+
 /* ===========================================================================
    تدوينات اليوميات
    =========================================================================== */
