@@ -233,6 +233,39 @@ a { color: inherit; }
 }
 .icon-btn:hover { background: var(--health-wash); color: var(--health-deep); }
 
+/* ===== صفحة أصناف الصرف =====
+   قائمة على ورق الدفتر — نفس مفردات .list-row، بس border من غير shadow عشان
+   الـghost-card مايتكررش، والصف المخفي باين باين (مش opacity وخلاص). */
+.cat-manage-card { margin-bottom: 20px; }
+.cat-rows { display: flex; flex-direction: column; gap: 8px; }
+.cat-row {
+  display: flex; align-items: center; gap: 12px;
+  background: var(--surface-card);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-md);
+  padding: 10px 14px;
+  transition: border-color var(--dur-fast) var(--ease-soft), background var(--dur-fast) var(--ease-soft);
+}
+.cat-row:hover { border-color: var(--finances); }
+.cat-row .cat-ic { font-size: 20px; line-height: 1; width: 26px; text-align: center; flex: none; }
+.cat-row .cat-name { font: 700 var(--text-sm)/1.4 var(--font-body); color: var(--ink); flex: 1; min-width: 0; }
+.cat-row .cat-used { font: var(--text-xs)/1.4 var(--font-body); color: var(--ink-muted); flex: none; }
+.cat-row .icon-btn:hover { background: var(--finances-wash); color: var(--finances-deep); }
+/* المخفي: حدود متقطّعة + كتابة باهتة — باين إنه مستني، مش متمسوح. */
+.cat-row.is-off { background: var(--paper-deep); border-style: dashed; }
+.cat-row.is-off .cat-name, .cat-row.is-off .cat-used { color: var(--ink-faint); }
+.cat-row.is-editing { border-color: var(--finances); background: var(--finances-wash); }
+.cat-row.is-editing .cat-e-icon { width: 56px; text-align: center; flex: none; }
+.cat-row.is-editing .cat-e-name { flex: 1; min-width: 0; }
+.icon-btn.is-locked { opacity: .35; cursor: not-allowed; }
+.icon-btn.is-locked:hover { background: transparent; color: var(--ink-faint); }
+.cat-empty, .fin-manage-empty {
+  padding: 22px 16px; text-align: center;
+  font: var(--text-sm)/1.6 var(--font-body); color: var(--ink-muted);
+  border: 1px dashed var(--hairline); border-radius: var(--radius-md);
+}
+.cat-error { margin: 8px 0 0; min-height: 1.2em; font: 700 var(--text-sm)/1.4 var(--font-body); color: var(--danger-deep, #b52b27); }
+
 /* ===========================================================================
    Chips & Badges
    =========================================================================== */

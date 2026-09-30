@@ -1,4 +1,4 @@
-/* ===================== State ===================== */
+﻿/* ===================== State ===================== */
 const state = {
   me: null,
   journal: [],
@@ -330,7 +330,8 @@ function gotoTab(tab) {
   if (tab === "health") { renderHealthPage(); }
   if (tab === "habits") renderHabitsPage();
   if (tab === "goals") renderGoalsPage();
-  if (tab === "finances") renderFinancesPage();
+    if (tab === "finances") renderFinancesPage();
+    if (tab === "categories") renderCategoriesPage();
   if (tab === "ideas") renderIdeasPage();
   if (tab === "tasks") renderTasksPage();
   if (tab === "assets") renderAssetsPage();
@@ -2092,126 +2093,137 @@ function fillCategorySelect() {
   const sel = $("finCategory");
   if (!sel || !state.categories.length) return;
   const cur = sel.value;
-  sel.innerHTML = state.categories
+  // المخفية ماتظهرش في اختيار عملية جديدة — بس القيود القديمة اللي عليها بتفضل
+  // صح في القوائم والتقارير (هي مش محذوفة أصلاً).
+  const shown = state.categories.filter((c) => c.is_active !== 0);
+  sel.innerHTML = shown
     .map((c) => `<option value="${escapeHtml(catName(c))}">${catIcon(c)} ${escapeHtml(catName(c))}</option>`)
     .join("");
-  if (cur && state.categories.some((c) => catName(c) === cur)) sel.value = cur;
+  if (cur && shown.some((c) => catName(c) === cur)) sel.value = cur;
 }
-/* ===== إدارة أصناف الصرف =====
-   موديل واحد: إضافة/إعادة تسمية/حذف أصناف الصرف من غير ما نعدّل الكود. */
-const FIN_MANAGE = {
-  kind: "categories",
-  editingId: null,
-  open() {
-    this.kind = "categories";
-    this.editingId = null;
-    $("finManageHint").textContent = "حذف صنف بيرجّع قيوده لأخرى. «أخرى» ما بتتحذفش.";
-    $("finManageName").value = "";
-    $("finManageIcon").value = "";
-    this.status("");
-    $("finManageOverlay")?.classList.remove("hidden");
-    this.render();
-    $("finManageName")?.focus();
-  },
-  close() {
-    $("finManageOverlay")?.classList.add("hidden");
-    this.editingId = null;
-  },
-    get items() { return state.categories || []; },
-  // api() بترجع Response ومي بترميش على 4xx، فبنقرا res.ok بأنفسنا.
-  status(msg) {
-    const el = $("finManageStatus");
-    if (el) el.textContent = msg || "";
-  },
-  async send(res, okMsg) {
-    if (res.ok) { this.status(""); const r = await res.json().catch(() => ({})); await this.refresh(); return r; }
-    const r = await res.json().catch(() => ({}));
-    this.status(r.error || `فشل (${res.status})`);
-    return null;
-  },
-  render() {
-    const el = $("finManageList");
-    if (!el) return;
-    const items = this.items;
-    if (!items.length) {
-      el.innerHTML = `<div class="fin-manage-empty">القائمة فاضية — أضف أول عنصر من فوق.</div>`;
-      return;
-    }
-    el.innerHTML = items.map((it) => {
-      const nm = catName(it);
-      const ic = catIcon(it);
-      if (this.editingId === it.id) {
-        return `<div class="fin-manage-row" data-id="${it.id}">
-          <input class="field fm-edit" id="fmEditName" value="${escapeHtml(nm)}" maxlength="40" />
-          <input class="field fm-edit" id="fmEditIcon" value="${escapeHtml(ic)}" maxlength="4" style="width:56px;text-align:center" />
-          <button type="button" class="btn finances sm" data-act="save">حفظ</button>
-          <button type="button" class="btn ghost sm" data-act="cancel">إلغاء</button>
-        </div>`;
-      }
-      return `<div class="fin-manage-row" data-id="${it.id}">
-        <span class="fm-icon">${ic || "📦"}</span>
-        <span class="fm-name">${escapeHtml(nm)}</span>
-        ${extra}
-        <button type="button" class="icon-btn" data-act="edit" title="إعادة تسمية" aria-label="إعادة تسمية ${escapeHtml(nm)}">✎</button>
-        <button type="button" class="icon-btn" data-act="del" title="حذف" aria-label="حذف ${escapeHtml(nm)}">🗑</button>
-      </div>`;
-    }).join("");
-  },
-  async refresh() {
-    const base = "/api/finance-categories";
-    const r = await api(base).then((x) => x.json());
-    state.categories = r;
-    this.render();
-    fillCategorySelect();
-  },
+/* ===== صفحة أصناف الصرف =====
+   إضافة/تعديل/إخفاء من غير مودال ومن غير «متأكد؟». الإخفاء مش حذف: الصف
+   بيفضل موجود وعملياته مربوطة بيه بالاسم — فمفيش lost records ولا lost money. */
+const CAT_EDIT = { id: null };
+
+const CAT_ACT_ICONS = {
+  edit: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>',
+  hide: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.7 5.1A9.9 9.9 0 0 1 12 5c5 0 9 4.5 9 7a11.6 11.6 0 0 1-2.4 3.3M6.6 6.6A11.5 11.5 0 0 0 3 12c0 2.5 4 7 9 7a9.8 9.8 0 0 0 4.2-.9"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/><path d="m2 2 20 20"/></svg>',
+  restore: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>',
 };
+// عدد العمليات اللي على الصنف. كل العمليات محمّلة في state.finance أصلًا، فمفيش
+// طلب شبكة — الرقم بيتحدّث مع كل تعديل.
+function catUseCount(name) {
+  return (state.finance || []).filter((f) => (f.category || "أخرى") === name).length;
+}
+function catRowHtml(c, isHidden) {
+  const nm = catName(c), ic = catIcon(c);
+  const isOther = nm === "أخرى";
+  if (CAT_EDIT.id === c.id) {
+    return `<div class="cat-row is-editing" data-id="${c.id}">
+      <input class="field cat-e-icon" id="catEditIcon" value="${escapeHtml(ic)}" maxlength="4" aria-label="الرمز" />
+      <input class="field cat-e-name grow" id="catEditName" value="${escapeHtml(nm)}" maxlength="40" aria-label="اسم الصنف" />
+      <button type="button" class="btn finances sm" data-act="save">حفظ</button>
+      <button type="button" class="btn ghost sm" data-act="cancel">إلغاء</button>
+    </div>`;
+  }
+  const used = catUseCount(nm);
+  return `<div class="cat-row${isHidden ? " is-off" : ""}" data-id="${c.id}">
+    <span class="cat-ic" aria-hidden="true">${ic || "📦"}</span>
+    <span class="cat-name">${escapeHtml(nm)}</span>
+    <span class="cat-used">${used ? `${arNum(used)} عملية` : "لسه مستخدمش"}</span>
+    <button type="button" class="icon-btn" data-act="edit" title="غيّر الاسم أو الرمز" aria-label="تعديل ${escapeHtml(nm)}">${CAT_ACT_ICONS.edit}</button>
+    ${isHidden
+      ? `<button type="button" class="icon-btn" data-act="restore" title="اظهره في الاختيار تاني" aria-label="إظهار ${escapeHtml(nm)}">${CAT_ACT_ICONS.restore}</button>`
+      : isOther
+        ? `<button type="button" class="icon-btn is-locked" disabled title="«أخرى» لازم تفضل ظاهرة" aria-label="«أخرى» ما بتتخفاش">${CAT_ACT_ICONS.hide}</button>`
+        : `<button type="button" class="icon-btn" data-act="hide" title="اخفيه من الاختيار — عملياته هتفضل زي ما هي" aria-label="إخفاء ${escapeHtml(nm)}">${CAT_ACT_ICONS.hide}</button>`}
+  </div>`;
+}
+function renderCategoriesPage() {
+  const cats = state.categories || [];
+  const active = cats.filter((c) => c.is_active !== 0);
+  const off = cats.filter((c) => c.is_active === 0);
 
-$("finManageClose")?.addEventListener("click", () => FIN_MANAGE.close());
-$("finManageOverlay")?.addEventListener("click", (e) => { if (e.target === $("finManageOverlay")) FIN_MANAGE.close(); });
-document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && !$("finManageOverlay")?.classList.contains("hidden")) FIN_MANAGE.close();
-});
-$("finManageCats")?.addEventListener("click", () => FIN_MANAGE.open());
+  const list = $("catActiveList");
+  if (list) {
+    list.innerHTML = active.length
+      ? active.map((c) => catRowHtml(c, false)).join("")
+      : `<div class="cat-empty">مفيش أصناف ظاهرة — أضف واحد من فوق.</div>`;
+  }
+  const card = $("catHiddenCard"), hlist = $("catHiddenList");
+  if (card) card.hidden = off.length === 0;
+  if (hlist) hlist.innerHTML = off.map((c) => catRowHtml(c, true)).join("");
+  const cnt = $("catActiveCount");
+  if (cnt) cnt.textContent = `${arNum(active.length)} صنف`;
+}
+// بعد أي تعديل: نحدّث القوائم (اختيار الصنف + صفحة الإدارة) والعمليات لو
+// إعادة تسمية كانت، لأن الاسم بينزل cascade على القيود القديمة.
+async function catRefresh(reloadFinance = false) {
+  const r = await api("/api/finance-categories").then((x) => x.json());
+  state.categories = Array.isArray(r) ? r : [];
+  if (reloadFinance) await loadAll(false);
+  else { fillCategorySelect(); renderCategoriesPage(); }
+}
+function catError(msg) {
+  const el = $("catAddError");
+  if (el) el.textContent = msg || "";
+}
 
-$("finManageForm")?.addEventListener("submit", async (e) => {
+$("catAddForm")?.addEventListener("submit", async (e) => {
   e.preventDefault();
-  const name = $("finManageName").value.trim();
-  const icon = $("finManageIcon").value.trim();
+  const name = $("catAddName").value.trim();
+  const icon = $("catAddIcon").value.trim();
   if (!name) return;
-  const base = "/api/finance-categories";
-  const r = await FIN_MANAGE.send(await api(base, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name, icon }) }));
-  if (!r) return;
-  $("finManageName").value = ""; $("finManageIcon").value = "";
+  catError("");
+  const res = await api("/api/finance-categories", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name, icon }),
+  });
+  if (!res.ok) { catError((await res.json().catch(() => ({}))).error || "مش قادر أضيف الصنف"); return; }
+  $("catAddName").value = ""; $("catAddIcon").value = "";
+  $("catAddName").focus();
+  await catRefresh();
 });
 
-$("finManageList")?.addEventListener("click", async (e) => {
+$("catActiveList")?.addEventListener("click", onCatRowClick);
+$("catHiddenList")?.addEventListener("click", onCatRowClick);
+async function onCatRowClick(e) {
   const btn = e.target.closest("[data-act]");
   if (!btn) return;
-  const row = btn.closest(".fin-manage-row");
+  const row = btn.closest(".cat-row");
   const id = Number(row?.dataset.id);
   if (!id) return;
-  const act = btn.dataset.act;
   const base = "/api/finance-categories";
-  if (act === "edit") { FIN_MANAGE.editingId = id; FIN_MANAGE.render(); $("fmEditName")?.focus(); return; }
-  if (act === "cancel") { FIN_MANAGE.editingId = null; FIN_MANAGE.render(); return; }
+  const act = btn.dataset.act;
+
+  if (act === "edit") { CAT_EDIT.id = id; renderCategoriesPage(); $("catEditName")?.focus(); $("catEditName")?.select(); return; }
+  if (act === "cancel") { CAT_EDIT.id = null; renderCategoriesPage(); return; }
   if (act === "save") {
-    const name = $("fmEditName")?.value.trim();
-    const icon = $("fmEditIcon")?.value.trim();
+    const name = $("catEditName")?.value.trim();
+    const icon = $("catEditIcon")?.value.trim();
     if (!name) return;
-    const r = await FIN_MANAGE.send(await api(`${base}/${id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name, icon }) }));
-    if (!r) return;
-    FIN_MANAGE.editingId = null;
-    await loadAll(false);
+    const res = await api(`${base}/${id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name, icon }) });
+    if (!res.ok) { catError((await res.json().catch(() => ({}))).error || "مش قادر أعدّل"); return; }
+    CAT_EDIT.id = null;
+    await catRefresh(true); // الاسم بيتحدّث على القيود القديمة كمان
     return;
   }
-  if (act === "del") {
-    const nm = (state.categories || []).find((x) => x.id === id);
-    const label = catName(nm);
-    if (!(await askConfirm({ title: "تأكيد الحذف", text: `هتحذف «${label}».`, ok: "احذف", danger: true }))) return;
-    const r = await FIN_MANAGE.send(await api(`${base}/${id}`, { method: "DELETE" }));
-    if (!r) return;
-    if (r.moved) FIN_MANAGE.status(`نقلنا ${arNum(r.moved)} قيد لأخرى`);
-    await loadAll(false);
+  // إخفاء/إظهار — على طول، من غير تأكيد. مخالف لقرار المستخدم: مفيش lost data.
+  if (act === "hide" || act === "restore") {
+    const res = act === "hide"
+      ? await api(`${base}/${id}`, { method: "DELETE" })
+      : await api(`${base}/${id}/restore`, { method: "POST" });
+    if (!res.ok) { catError((await res.json().catch(() => ({}))).error || "مش قادر أغيّر الحالة"); return; }
+    await catRefresh();
+  }
+}
+// Enter يحفظ، Esc يرجّع — من غير ما تديوس على زر.
+document.addEventListener("keydown", (e) => {
+  if (CAT_EDIT.id == null) return;
+  if (e.key === "Escape") { CAT_EDIT.id = null; renderCategoriesPage(); return; }
+  if (e.key === "Enter" && (e.target.id === "catEditName" || e.target.id === "catEditIcon")) {
+    e.preventDefault();
+    e.target.closest(".cat-row")?.querySelector('[data-act="save"]')?.click();
   }
 });
 

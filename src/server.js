@@ -21,7 +21,7 @@ import {
   ensureFinanceCategories,
   addFinanceCategory,
   renameFinanceCategory,
-  deleteFinanceCategory,
+  setFinanceCategoryActive,
   listHealth,
   addHealth,
   deleteHealth,
@@ -1206,7 +1206,15 @@ export async function createApp() {
   app.delete("/api/finance-categories/:id", async (req, res) => {
     const user = await gate(req, res);
     if (!user) return;
-    const r = await deleteFinanceCategory({ userId: user.id, id: Number(req.params.id) });
+    // DELETE = إخفاء، مش مسح. القيود بتفضل مربوطة بالاسم والصف بيفضل موجود.
+    const r = await setFinanceCategoryActive({ userId: user.id, id: Number(req.params.id), isActive: false });
+    if (r.error) return res.status(400).json({ error: r.error });
+    res.json({ ...r, categories: await listFinanceCategories(user.id) });
+  });
+  app.post("/api/finance-categories/:id/restore", async (req, res) => {
+    const user = await gate(req, res);
+    if (!user) return;
+    const r = await setFinanceCategoryActive({ userId: user.id, id: Number(req.params.id), isActive: true });
     if (r.error) return res.status(400).json({ error: r.error });
     res.json({ ...r, categories: await listFinanceCategories(user.id) });
   });

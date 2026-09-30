@@ -49,6 +49,7 @@ await db.exec(`
     name        TEXT NOT NULL,
     icon        TEXT,
     sort_order  INTEGER NOT NULL DEFAULT 0,
+    is_active   INTEGER NOT NULL DEFAULT 1,   -- 0 = مخفي (مش محذوف: القيود بتفضل عليه)
     created_at  TEXT NOT NULL,
     UNIQUE(user_id, name)
   );
@@ -328,6 +329,7 @@ for (const t of ["entries", "finance", "health", "conversations", "goals", "cond
 await addColumnIfMissing("health", "body_region", "TEXT");
 await addColumnIfMissing("finance", "category", "TEXT"); // أكل، مواصلات، فواتير...
 await addColumnIfMissing("finance", "currency", "TEXT");
+await addColumnIfMissing("finance_categories", "is_active", "INTEGER NOT NULL DEFAULT 1"); // إخفاء بدل الحذف
 await addColumnIfMissing("users", "email", "TEXT");          // التسجيل بالإيميل
 await addColumnIfMissing("users", "password_hash", "TEXT");
 await addColumnIfMissing("tasks", "completed_at", "TEXT");
@@ -746,10 +748,13 @@ const DEFAULT_FINANCE_CATEGORIES = [  ["أكل", "🍔"], ["مواصلات", "�
 export const FINANCE_CATEGORIES = DEFAULT_FINANCE_CATEGORIES.map(([n]) => n);
 
 const listFinCatsStmt = db.prepare(
-  `SELECT id, name, icon, sort_order FROM finance_categories WHERE user_id = ? ORDER BY sort_order, id`
+  `SELECT id, name, icon, sort_order, is_active FROM finance_categories WHERE user_id = ? ORDER BY sort_order, id`
 );
-export async function listFinanceCategories(userId) {
-  return (await listFinCatsStmt.all(userId));
+// byDefault = true بترجّع الظاهرة بس (لاختيار الصنف في عملية جديدة). الصفات
+// المخفية بتفضل محفوظةNAME وربطها بالقيود زي ما هي.
+export async function listFinanceCategories(userId, onlyActive = false) {
+  const rows = await listFinCatsStmt.all(userId);
+  return onlyActive ? rows.filter((c) => c.is_active !== 0) : rows;
 }
 // زرع مرة واحدة: لو المستخدم مالوش صفوف، نزرع الافتراضي. وبعدها القراءة من الجدول بس.
 export async function ensureFinanceCategories(userId) {
@@ -765,11 +770,19 @@ export async function ensureFinanceCategories(userId) {
 export async function addFinanceCategory({ userId, name, icon }) {
   const nm = normName(name);
   if (!nm) return { error: "اسم الصنف مطلوب" };
+  // التكرار بيتحسب على كل الأصناف (حتى المخفية) عشان متحصلكش اسم مرتين؛ لو
+  // الاسم ده مخفي، بنرجّعه ظاهر تاني بدل ما نعمل نسخة جديدة.
   const dupe = (await listFinanceCategories(userId)).find((c) => normName(c.name) === nm);
-  if (dupe) return { error: "الصنف موجود بالفعل" };
+  if (dupe) {
+    if (dupe.is_active === 0) {
+      await db.prepare(`UPDATE finance_categories SET is_active = 1 WHERE user_id = ? AND id = ?`).run(userId, dupe.id);
+      return { id: dupe.id, restored: true };
+    }
+    return { error: "الصنف موجود بالفعل" };
+  }
   const mx = (await db.prepare(`SELECT COALESCE(MAX(sort_order), -1) m FROM finance_categories WHERE user_id = ?`).get(userId));
   const info = await db.prepare(
-    `INSERT INTO finance_categories (user_id, name, icon, sort_order, created_at) VALUES (?, ?, ?, ?, ?)`
+    `INSERT INTO finance_categories (user_id, name, icon, sort_order, is_active, created_at) VALUES (?, ?, ?, ?, 1, ?)`
   ).run(userId, String(name).trim(), icon || null, Number(mx.m) + 1, now());
   return { id: Number(info.lastInsertRowid) };
 }
@@ -789,17 +802,19 @@ export async function renameFinanceCategory({ userId, id, name, icon }) {
   }
   return { ok: true };
 }
-// حذف: القيود المرتبطة ما تتمسحش — بترجع لأخرى عشان فاقدش فلوسه من السجل.
-export async function deleteFinanceCategory({ userId, id }) {
+// إخفاء: القيود والصف نفسه بيفضلوا زي ما هما — مفيش حاجة بتتمسح ولا بتتحرك.
+// الغرض: الصنف يختفي من قوائم الاختيار بس السجل-finوسة مبيتنقّصش، وكمان يقدر
+// يرجع تاني بضغطة.
+export async function setFinanceCategoryActive({ userId, id, isActive }) {
   const cur = await db.prepare(`SELECT * FROM finance_categories WHERE user_id = ? AND id = ?`).get(userId, id);
   if (!cur) return { error: "الصنف غير موجود" };
-  if (cur.name === "أخرى") return { error: "مينفعش تحذف «أخرى»" };
-  await ensureFinanceCategories(userId); // نتأكد إن «أخرى» موجودة قبل ما نرجّعليها
-  const moved = (await db.prepare(
-    `UPDATE finance SET category = 'أخرى' WHERE user_id = ? AND category = ?`
-  ).run(userId, cur.name)).changes;
-  await db.prepare(`DELETE FROM finance_categories WHERE user_id = ? AND id = ?`).run(userId, id);
-  return { ok: true, movedTo: "أخرى", moved: Number(moved || 0) };
+  if (!isActive && cur.name === "أخرى") return { error: "«أخرى» لازم تفضل ظاهرة" };
+  await db.prepare(`UPDATE finance_categories SET is_active = ? WHERE user_id = ? AND id = ?`)
+    .run(isActive ? 1 : 0, userId, id);
+  // عدد القيود اللي فاتحة على الصنف — عشان الواجهة تقول «٧ عمليات» قبل الإخفاء.
+  const used = (await db.prepare(`SELECT COUNT(*) c FROM finance WHERE user_id = ? AND category = ?`)
+    .get(userId, cur.name))?.c ?? 0;
+  return { ok: true, name: cur.name, is_active: isActive ? 1 : 0, used: Number(used) };
 }
 
 // تطبيع نص للمقارنة (شيل المسافات الزيادة + حروف صغيرة) — لكشف التكرار.

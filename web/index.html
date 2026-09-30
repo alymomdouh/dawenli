@@ -43,8 +43,12 @@
           </button>
           <button class="nav-btn finances" data-tab="finances">
             <span class="nb-ico"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12V7H5a2 2 0 0 1 0-4h14v4"/><path d="M3 5v14a2 2 0 0 0 2 2h16v-5"/><path d="M18 12a2 2 0 0 0 0 4h4v-4Z"/></svg></span>
-            <span>الفلوس</span>
-          </button>
+              <span>الفلوس</span>
+            </button>
+            <button class="nav-btn finances" data-tab="categories">
+              <span class="nb-ico"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h18M3 12h18M3 19h18"/><circle cx="7.5" cy="5" r="2" fill="var(--surface-card)"/><circle cx="14" cy="12" r="2" fill="var(--surface-card)"/><circle cx="10" cy="19" r="2" fill="var(--surface-card)"/></svg></span>
+              <span>أصناف الصرف</span>
+            </button>
           <button class="nav-btn goals" data-tab="tasks">
             <span class="nb-ico"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="17" rx="3"/><path d="M8 2v4M16 2v4M3 9h18M9 15l2 2 4-4"/></svg></span>
             <span>المهام والتقويم</span>
@@ -408,7 +412,7 @@
                 <div class="card">
                   <div class="card-head">
                     <h3>عملية جديدة</h3>
-                    <button type="button" class="btn ghost sm" id="finManageCats">⚙ الأصناف</button>
+                    <a class="btn ghost sm" href="#categories">⚙ الأصناف</a>
                   </div>
                   <form id="finForm" class="inline-form">
                     <select id="finDir" class="field">
@@ -470,14 +474,54 @@
                   <img src="/assets/illustrations/world-finances.svg" alt="عالم الفلوس" style="width:150px;height:150px" />
                   <span style="font-family:var(--font-display);font-weight:700;color:var(--finances-deep)">مدّخراتك تنمو</span>
                 </div>
-                <div class="card">
-                  <div class="card-head"><h3>آخر حركات</h3></div>
-                  <div id="finTx" class="tl-rows"></div>
+                  <div class="card">
+                    <div class="card-head"><h3>آخر العمليات</h3></div>
+                    <div id="finTx" class="tl-rows"></div>
+                  </div>
                 </div>
               </div>
-            </div>
-          </section>
+            </section>
 
+            <!-- ========== أصناف الصرف: إضافة/تعديل/إخفاء (من غير مودال) ========== -->
+            <section class="tab-panel hidden" data-panel="categories">
+              <div class="page-head">
+                <div>
+                  <span class="world-pill finances">عالم الفلوس</span>
+                  <h1>أصناف الصرف</h1>
+                </div>
+                <a class="btn ghost sm" href="#finances">← رجوع للفلوس</a>
+              </div>
+
+              <div class="card cat-manage-card">
+                <div class="card-head">
+                  <h3>＋ صنف جديد</h3>
+                  <span class="muted" style="font-size:var(--text-sm)">الاسم + رمز (اختياري) — وخلاص بتفضل تختاره في أي عملية</span>
+                </div>
+                <form id="catAddForm" class="inline-form" autocomplete="off">
+                  <input id="catAddIcon" class="field" placeholder="رمز" maxlength="4" style="width:64px;text-align:center" />
+                  <input id="catAddName" class="field grow" placeholder="اسم الصنف" required maxlength="40" />
+                  <button type="submit" class="btn finances sm">＋ أضف</button>
+                </form>
+                <p id="catAddError" class="cat-error" role="status"></p>
+              </div>
+
+              <div class="card">
+                <div class="card-head">
+                  <h3>الظاهرة في الاختيار</h3>
+                  <span class="muted" id="catActiveCount" style="font-size:var(--text-sm)"></span>
+                </div>
+                <div id="catActiveList" class="cat-rows"></div>
+              </div>
+
+              <div class="card" id="catHiddenCard" hidden>
+                <div class="card-head">
+                  <h3>مخفية</h3>
+                  <span class="muted" style="font-size:var(--text-sm)">ماشيطةش من الاختيار — بس عملياتها محفوظة زي ما هي. اظهرها تاني لو حبيت.</span>
+                </div>
+                <div id="catHiddenList" class="cat-rows is-hidden"></div>
+              </div>
+            </section>
+  
           <!-- ========== دفترك (هَب موحّد: يوميات/خواطر/أفكار/مشاكل) ========== -->
           <section class="tab-panel hidden" data-panel="dafter">
             <div class="page-head">
@@ -936,26 +980,6 @@
           <button class="icon-btn" id="editClose" aria-label="إغلاق">✕</button>
         </div>
         <form id="editForm" class="edit-form"></form>
-      </div>
-    </div>
-
-    <!-- إدارة أصناف الصرف: إضافة/إعادة تسمية/حذف بدون تعديل الكود -->
-    <div id="finManageOverlay" class="modal-overlay hidden">
-      <div class="modal" role="dialog" aria-modal="true" style="text-align:right;max-width:460px">
-        <div class="edit-head">
-          <h3 class="modal-title" id="finManageTitle" style="margin:0">أصناف الصرف</h3>
-          <button class="icon-btn" id="finManageClose" aria-label="إغلاق">✕</button>
-        </div>
-        <div class="fin-manage">
-          <form id="finManageForm" class="inline-form" autocomplete="off">
-            <input id="finManageName" class="field grow" placeholder="الصنف الجديد" required maxlength="40" />
-            <input id="finManageIcon" class="field" placeholder="رمز" maxlength="4" style="width:64px;text-align:center" />
-            <button type="submit" class="btn finances sm">＋ إضافة</button>
-          </form>
-          <div id="finManageList" class="fin-manage-list"></div>
-          <p class="muted" id="finManageHint" style="font-size:var(--text-sm);margin:10px 0 0"></p>
-          <p id="finManageStatus" style="font:var(--type-label);color:var(--danger-deep,#b52b27);margin:8px 0 0;min-height:1.2em"></p>
-        </div>
       </div>
     </div>
 
